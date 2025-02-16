@@ -1,0 +1,105 @@
+## Derivation of upward implied swaption volatility stress
+```{r}
+pivot_swaption_tibble <- function(swaption_tibble, name_value_col) {
+  swaption_tibble <- swaption_tibble |>
+    pivot_longer(
+      cols = everything(),
+      names_to = "name",
+      values_to = name_value_col
+    ) |>
+    separate_wider_delim(
+      cols = "name",
+      names = c("option_period", "swap_period"),
+      delim = "X"
+    ) |>
+    mutate(
+      option_period = str_replace_all(option_period, "Y", "") |> as.integer(),
+      swap_period = str_replace_all(swap_period, "Y", "") |> as.integer()
+    )
+
+  return(swaption_tibble)
+}
+
+compute_stressed_swaptions <- function(
+    timestamp,
+    impl_vol_surface,
+    impl_vol_change_untransformed,
+    nss_params, # parameters of the Nelson-Siegel-Svensson curve
+    pca,
+    joint_quantile) {
+  compute_price <- function(option_period, swap_period, impl_vol, impl_vol_stress = 0) {
+    sum(
+      0.5 * zero_coupon_bond(seq(option_period + 0.5, option_period + swap_period, by = 0.5))
+    ) * (impl_vol * (1 + impl_vol_stress)) / 10000 * sqrt(option_period / (2 * pi))
+  }
+
+  # cols: option_period, swap_period, impl_vol
+  swaption_surface <- impl_vol_surface |>
+    filter(Timestamp == timestamp) |>
+    select(-Timestamp) |>
+    pivot_swaption_tibble("impl_vol")
+
+  # compute price based in impl_vol
+  # cols: option_period, swap_period, impl_vol, price
+  swaption_surface <- swaption_surface |>
+    rowwise() |> # consider rows exclusively to compute vector valued sum in mutate()
+    mutate(
+      price = compute_price(option_period, swap_period, impl_vol)
+    )
+
+  # stressed impl_vol surface
+  impl_vol_surface_stress <- t(t(joint_quantile %*% t(pca$rotation[, 1:3])) + pca$center) |> as_tibble()
+  impl_vol_surface_stress_long <- pivot_swaption_tibble(impl_vol_surface_stress, "impl_vol_stress")
+
+  # cols: option_period, swap_period, impl_vol, price, impl_vol_stress, price_stress
+  swaption_surface <- swaption_surface |>
+    inner_join(impl_vol_surface_stress_long, by = join_by(option_period, swap_period)) |>
+    cbind("impl_vol_stress_untransformed" = impl_vol_change_untransformed |> as.numeric()) |>
+    rowwise() |>
+    mutate(
+      impl_vol_stress_abs = impl_vol * (1 + impl_vol_stress),
+      impl_vol_stress_untransformed_abs = impl_vol * (1 + impl_vol_stress_untransformed),
+      price_stress = compute_price(option_period, swap_period, impl_vol, impl_vol_stress),
+      price_stress_untransformed = compute_price(option_period, swap_period, impl_vol, impl_vol_stress_untransformed),
+    )
+
+  plot_swaption_surface_impl_vol <- plotly_3d(
+    swaption_surface |>
+      mutate(
+        impl_vol_stress = impl_vol * (1 + impl_vol_stress),
+        impl_vol_stress_untransformed = impl_vol * (1 + impl_vol_stress_untransformed)
+      ) |>
+      select(impl_vol, impl_vol_stress, impl_vol_stress_untransformed) |>
+      as.matrix(),
+    paste0("Observed and stressed swaption implied volatilities on ", timestamp),
+    "implied volatility"
+  )
+  plot_swaption_surface_price <- plotly_3d(
+    swaption_surface |> select(price, price_stress) |> as.matrix(),
+    paste0("Observed and stressed swaption prices on ", timestamp),
+    "price for nomial value 1"
+  )
+
+  return(list(
+    swaption_surface = swaption_surface,
+    plot_swaption_surface_impl_vol = plot_swaption_surface_impl_vol,
+    plot_swaption_surface_price = plot_swaption_surface_price
+  ))
+}
+```
+
+```{r}
+joint_quantile <- pca_annualized$joint_quantile_ar
+swaptions_stressed <- compute_stressed_swaptions(ymd("2023-12-29"), swaption_volatilities_d, NULL, pca, joint_quantile)
+swaptions_stressed$swaption_surface
+
+tmp <- swaptions_stressed$swaption_surface |>
+  mutate(
+    amount_per_swaption = 10 / price,
+    bel = amount_per_swaption * price,
+    bel_stress = amount_per_swaption * price_stress
+  )
+
+sum(tmp$bel)
+sum(tmp$bel_stress)
+```

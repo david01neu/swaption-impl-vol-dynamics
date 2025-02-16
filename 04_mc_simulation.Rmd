@@ -1,0 +1,600 @@
+## Example: Solvency capital requirement
+```{r}
+contract_value_increase = function(contract_value, guaranteed_rate, realized_rate) {
+  contract_value * pmax(guaranteed_rate, 0.9 * realized_rate)
+}
+
+pv_liabilities = function(params, n_years, liability_val, n_trials, investment_strategy='1yr', offset=0) {
+  guaranteed_rate = 0.01
+  #assets = rep(asset_val, n_years)
+  contract_value = rep(liability_val, n_trials)
+  bel = rep(0, n_trials)
+  bel_discounted = rep(0, n_trials)
+  guaranteed_benefit = rep(liability_val, n_trials)
+  surplus_benefit = rep(0, n_trials)
+  #set.seed(1)
+  tenor = 1
+  if (investment_strategy == '10yr') {
+    tenor = 10
+  }
+  zero_rates = sim_zero_rates(params, NULL, n_years+1/12, tenor=tenor, n_trials=n_trials, offset=offset)
+  
+  for (i in 1:n_years) {
+    realized_rate = 0
+    if (investment_strategy == '1yr') {
+      realized_rate = zero_rates$zero_rate[i*12,1,]
+    } else if (investment_strategy == '10yr') {
+      realized_rate = zero_rates$zero_rate[floor(i/tenor)*tenor*12+1,1,]
+    }
+    
+    discount_factor = exp(- apply(zero_rates$short_rate[1:(i*12),1,], 2, function(x) { sum(x)/12 }))
+    
+    cashflow_increase = contract_value_increase(contract_value, guaranteed_rate, realized_rate)
+    contract_value = contract_value + cashflow_increase
+    
+    surplus_benefit = surplus_benefit + (cashflow_increase - guaranteed_benefit * guaranteed_rate)
+    guaranteed_benefit = guaranteed_benefit + guaranteed_benefit * guaranteed_rate
+  }
+  
+  # discounted policyholder's cash flows
+  discount_factor = exp(- apply(zero_rates$short_rate[,1,], 2, function(x) { sum(x)/12 }))
+  bel_discounted = discount_factor * contract_value
+  #bel = discount_factor * bel
+  guaranteed_benefit = discount_factor * guaranteed_benefit
+  surplus_benefit = discount_factor * surplus_benefit
+  
+  return (list(
+    bel = bel_discounted,
+    guaranteed_benefit = guaranteed_benefit,
+    surplus_benefit = surplus_benefit
+  ))
+}
+
+sim_asset_return_real = function(g2f_params, assets_0, K) {
+  zero_rates = sim_zero_rates(g2f_params, NULL, 1, tenor=10, n_trials=K, offset=0)
+  zero_rates = zero_rates$zero_rate
+  print(dim(zero_rates))
+  return (zero_rates[dim(zero_rates)[1],,])
+}
+```
+
+```{r zero_rates_visualization}
+time = seq(0,n_years,by=1/12)
+tenor = 10
+a = 0.9561
+b = 0.0264
+sigma = 0.0071
+eta = 0.0155
+rho = -0.9695
+
+zero_rates = read_csv('zero_rates_stress.csv')[,1:100]
+  mutate(time=time) |>
+  as_tibble() |>
+  pivot_longer(
+    cols = -time,
+    names_to = 'trial',
+    values_to = 'spot_rate'
+  )
+
+emprical_summary_rates = zero_rates |>
+  group_by(time) |>
+  summarize(
+    mean = mean(spot_rate),
+    lower = quantile(spot_rate, 0.05),
+    upper = quantile(spot_rate, 0.95)
+  )
+
+expected_rates = tibble(
+  time = time,
+  mean = forward_rate_mean(time, tenor),
+  lower = mean - 1.96 * forward_rate_vol(time, tenor),
+  upper = mean + 1.96 * forward_rate_vol(time, tenor)
+)
+
+subtitle = glue(
+  '40 risk-neutral projections of ten-year interest rate'
+)
+
+ggplot() +
+  geom_line(data = zero_rates, mapping = aes(x=time, y=spot_rate, col=trial), linewidth=0.6) +
+  geom_ribbon(data = expected_rates, aes(time, ymin = lower, ymax = upper), alpha=0.4) +
+  geom_line(data = expected_rates, aes(time, mean), linewidth=0.6) +
+  geom_line(data = emprical_summary_rates, aes(time, mean), linewidth=0.6) +
+  geom_line(data = emprical_summary_rates, aes(time, lower), linewidth=0.6) +
+  geom_line(data = emprical_summary_rates, aes(time, upper), linewidth=0.6) +
+  labs(
+    title = 'Monte-Carlo simulations of interest rates using G2++',
+    subtitle = subtitle,
+    x = 'time (years)',
+    y = 'interest rate'
+  ) +
+  theme(
+    plot.subtitle = element_markdown(),
+    legend.position = "none"
+  )
+```
+
+```{r mc_solvency_overview}
+assets_0 = 11000
+liabilities_base = pv_liabilities(g2f_params, n_years, contract_value_0, K, investment_strategy='10yr', offset=0)$pv_liability
+liabilities_stress = pv_liabilities(g2f_params, n_years, contract_value_0, K, investment_strategy='1yr', offset=0)$pv_liability
+
+nav_base = assets_0 - liabilities_base
+nav_stress = assets_0 - liabilities_stress
+
+scr = max(nav_stress - nav_base, 0)
+
+simulated_data = tibble()
+
+K = 100
+guaranteed_rate=0.01
+n_years = 30
+contract_value_0 = 10000
+
+investment_strategies = c('1yr', '10yr')
+scenarios = c('base', 'stress_pca', 'stress_simple')
+for (investment_strategy in investment_strategies) {
+  for (scenario in scenarios) {
+    if (scenario == 'base') {
+      scenario_params = c(0.4244, 0.0428, 0.0924, 0.0150, 0.0432)#c(0.0518, 0.4604, 0.0163, 0.0927, -0.5027)
+    } else if (scenario == 'stress_pca') {
+      scenario_params = c(0.0580, 0.2564, 0.0302, 0.1363, -0.8715)
+    } else if (scenario == 'stress_simple') {
+      scenario_params = c(0.2460, 0.0800, 0.1620, 0.0482, -0.9368)
+    }
+    
+    liabilities = pv_liabilities(scenario_params, n_years, contract_value_0, K, investment_strategy=investment_strategy, offset=0)
+    simulated_data = simulated_data |> 
+      rbind(
+        c(scenario, investment_strategy, mean(liabilities$bel), mean(liabilities$guaranteed_benefit), mean(liabilities$surplus_benefit))
+      )
+  }
+}
+colnames(simulated_data) = c('scenario', 'investment_strategy', 'bel', 'guaranteed_benefit', 'surplus_benefit')
+simulated_data
+
+bel_base_1yr = simulated_data |> filter(scenario == 'base' & investment_strategy == '1yr') |> select(bel) |> as.numeric()
+bel_base_10yr = simulated_data |> filter(scenario == 'base' & investment_strategy == '10yr') |> select(bel) |> as.numeric()
+nav_base = assets_0 - c(rep(bel_base_1yr, 3), rep(bel_base_10yr, 3))
+```
+
+```{r}
+library(scales)
+tibble(
+    Position = c('assets', 'liabilities', 'risk_margin', 'assets', 'liabilities', 'risk_margin'),
+    EUR = c(assets_0, mean(liabilities_normal$pv_liability), 200, assets_0, mean(liabilities_stress$pv_liability), 200),
+    year = c(rep('normal scenario', 3), rep('stress scenario', 3))
+  ) |>
+  pivot_wider(
+    names_from = Position,
+    values_from = EUR
+  ) |>
+  mutate(own_funds = assets - liabilities - risk_margin) |>
+  pivot_longer(
+    cols = -year,
+    names_to = 'Position',
+    values_to = 'EUR'
+  ) |>
+  mutate(al = case_when(Position %in% c("assets") ~ "assets", T ~ "liabilities")) |>
+  ggplot(aes(x = al, y = EUR, fill = reorder(Position, EUR))) + 
+  geom_col(alpha = 0.8, color = "black") +
+  geom_text(aes(label = str_c(Position, number(EUR/1000, big.mark = "'"), sep = "\n")), position = position_stack(vjust = 0.5), size = 3) +
+  geom_segment(x = 1.5, y = 10, xend = 1.5, yend = 1000000000000, color = "black") +
+  scale_x_discrete(position = "top") +
+  scale_fill_brewer(palette = "Spectral") +
+  facet_wrap(~ year) +
+  labs(title = "Solvency overview",
+       subtitle = "31.12.2023",
+       y = "",
+       x = "") +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5),
+        plot.subtitle = element_text(hjust=0.5),
+        axis.line.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank())
+```
+
+```{r expected_forward_rates_and_volatility}
+
+time = seq(0,n_years,by=1/12)
+
+params = matrix(c(
+  c(0.972502789667905,	0.0878333711295968,	0.0830918063221897,	0.0257939158019826,	0.9),
+  c(0.112258727403484,	0.635063151391824,	0.0286513320937885,	0.0479998878175290,	0.9),
+  c(0.0824000000000000,	0.451200000000000,	0.0215000000000000,	0.0386000000000000,	0.9),
+  c(0.981500000000000,	0.0490000000000000,	0.0104000000000000,	0.0123000000000000,	0.9)),
+  ncol = 5, byrow=TRUE
+)
+rownames(params) = c('stress AR(1)', 'stress Copula', 'stress naive', 'base')
+vizdata = tibble()
+for (i in 1:nrow(params)) {
+  a = params[i,1]
+  b = params[i,2]
+  sigma = params[i,3]
+  eta = params[i,4]
+  rho = params[i,5]
+  
+  tmp = tibble(
+    scenario = rownames(params)[i],
+    time = time,
+    inst_forward_rate_vol = inst_forward_rate_vol(time, a, b, sigma, eta, rho),
+    forward_rate_mean = forward_rate_mean(time, time+tenor)
+  )
+  vizdata = vizdata |> rbind(tmp)
+}
+
+plot_forward_rate = ggplot(data = vizdata, mapping = aes(x=time, group=scenario, col=scenario, fill=scenario)) +
+  #geom_ribbon(aes(ymin = lower, ymax = upper), alpha=0.2) +
+  geom_line(aes(y = forward_rate_mean), linewidth=0.6)
+plot_forward_rate = plot_forward_rate +
+  labs(
+    title = 'Two factor Hull-White model calibration implications',
+    subtitle = paste0('ten-year forward rates f(t,t,t+10)'),
+    x = 'time t (years)',
+    y = 'forward rate'
+  ) +
+  theme(
+    plot.subtitle = element_markdown()
+  )
+
+plot_forward_rate_volatility = ggplot(data = vizdata, mapping = aes(x=time, group=scenario, col=scenario, fill=scenario)) +
+  geom_line(aes(y = inst_forward_rate_vol), linewidth=0.6)
+plot_forward_rate_volatility = plot_forward_rate_volatility +
+  labs(
+    title = 'Two factor Hull-White model calibration implications',
+    subtitle = TeX("volatility of instanataneous forward rates $\\sigma_f(0,t)$"),
+    x = 'time t (years)',
+    y = 'absolute volatility'
+  )
+
+ggarrange(
+  plot_forward_rate,
+  plot_forward_rate_volatility,
+  nrow = 1,
+  common.legend = TRUE, legend = 'bottom'
+)
+```
+
+```{r}
+simulated_data = read.csv('simulated_data.csv', header = FALSE)
+
+vizdata = tibble(
+    nsim = 1:1e5,
+    scenario_base = cumsum(simulated_data[,4])/nsim,
+    scenario_stress1 = cumsum(simulated_data[,5])/nsim,
+    scenario_stress2 = cumsum(simulated_data[,6])/nsim
+  )
+colnames(vizdata) = c('nsim', 'base scenario', 'scenario stress 1', 'scenario stress 2')
+vizdata = vizdata |> 
+  slice_tail(n = 1e5-1000) |>
+  pivot_longer(
+    cols = -nsim,
+    names_to = 'type'
+  )
+
+ggplot(vizdata, aes(x=nsim, y=value, col=type)) +
+  geom_line(linewidth = 0.6) +
+  labs(
+    title = 'Monte-Carlo simulation paths of BEL',
+    subtitle = '10yr investment horizon',
+    x = 'number of simulations',
+    y = 'BEL'
+  )
+
+summary(simulated_data[,1])
+```
+
+```{r}
+#' winsorizes/truncates values for a given vector and quantile ranges
+#'
+#' @param vector vector with numerical values
+#' @param lower_quantile_boundary lower quantile boundary
+#' @param upper_quantile_boundary upper quantile boundary
+#'
+#' @return winsorized vector with min(vector) = lower_quantile and
+#'         max(vector) = upper_quantile
+winsorize <- function(vector, lower_quantile_boundary = 0.05,
+                      upper_quantile_boundary = 0.95) {
+  if (lower_quantile_boundary > upper_quantile_boundary) {
+    warning("Lower quantile boundary is greater than upper quantile boundary.")
+  }
+
+  lower_quantile <- quantile(vector, lower_quantile_boundary, na.rm = TRUE)
+  upper_quantile <- quantile(vector, upper_quantile_boundary, na.rm = TRUE)
+
+  vector[!is.na(vector) & vector < lower_quantile] <- lower_quantile
+  vector[!is.na(vector) & vector > upper_quantile] <- upper_quantile
+
+  return(vector)
+}
+
+tmp = read_csv('simulated_data.csv', col_names = FALSE) |> as.matrix()
+
+tmp = tmp[,seq(1,3e5,by=3)] |>
+  t()
+colnames(tmp) = c('1yr_base', '1yr_ar1', '1yr_copula', '1yr_naive',
+                  '10yr_base', '10yr_ar1', '10yr_copula', '10yr_naive')
+tmp = as_tibble(tmp)
+
+tmp_winsorized = tmp %>%
+  mutate(across(all_of(1:8),
+      .fns = ~ winsorize(.x, 0, 0.98)
+    )) %>%
+  pivot_longer(
+    cols = everything(),
+    values_to = 'value',
+    names_to = 'scenario'
+  )
+
+ggplot(data = tmp_winsorized, mapping = aes(x=value, group=scenario)) +
+  geom_histogram() +
+  #geom_vline(aes(xintercept = mean(value)), linetype='dashed') +
+  geom_text(
+    aes(
+      x = Inf, y = Inf,
+      label = "outliers are winsorized"
+    ),
+    stat = "unique",
+    hjust = 1,
+    vjust = 1,
+    size = 2
+  ) +
+  facet_wrap(. ~ scenario, scales = 'free', nrow = 2) +
+  labs(
+    title = 'Histogram of Monte Carlo estimates for BEL',
+    subtitle = '100 000 estimates',
+    x = 'BEL estimate',
+    y = 'frequency'
+  )
+
+hist(tmp[1,] |> as.numeric(), breaks=70, xlim=c(0,25000))
+
+ggplot()
+```
+
+## Sensitivity analyses of HW2 model parameters
+```{r}
+# data obtained from simulations in g2pp_calibration_simulation_sensitvity_analysis.m
+hw2_a_sensitivity_bel_mean = matrix(1e4 * c(
+    0.9057,    1.0333,    0.9534,    0.9437,
+    0.9036,    1.0288,    0.9709,    0.9550,
+    0.9019,    1.0220,    0.9859,    0.9649,
+    0.9006,    1.0147,    0.9984,    0.9737,
+    0.8995,    1.0076,    1.0087,    0.9813,
+    0.8986,    1.0010,    1.0172,    0.9881,
+    0.8979,    0.9949,    1.0241,    0.9939,
+    0.8973,    0.9893,    1.0297,    0.9988,
+    0.8968,    0.9843,    1.0341,    1.0030,
+    0.8963,    0.9799,    1.0377,    1.0066,
+    0.8960,    0.9758,    1.0405,    1.0096), ncol=4, byrow=TRUE)
+
+hw2_a_sensitivity_bel_median = matrix(1e3 * c(
+    7.5545,    3.4397,    2.8890,    3.6553,
+    7.5991,    3.9382,    3.4334,    4.0662,
+    7.6345,    4.3152,    3.9308,    4.4312,
+    7.6587,    4.6017,    4.4012,    4.7851,
+    7.6797,    4.8312,    4.8343,    5.0997,
+    7.6952,    5.0106,    5.2414,    5.4106,
+    7.7093,    5.1511,    5.5769,    5.6792,
+    7.7236,    5.2729,    5.8832,    5.9339,
+    7.7340,    5.3822,    6.1467,    6.1391,
+    7.7430,    5.4674,    6.3798,    6.3371,
+    7.7449,    5.5436,    6.5940,    6.5208), ncol=4, byrow=TRUE)
+
+hw2_a_sensitivity_bel_var = matrix(1e9 * c(
+    0.0383,    1.0462,    1.3277,    0.7888,
+    0.0358,    0.7617,    0.9396,    0.6149,
+    0.0341,    0.5984,    0.6949,    0.4916,
+    0.0327,    0.4949,    0.5346,    0.4028,
+    0.0317,    0.4247,    0.4250,    0.3371,
+    0.0310,    0.3745,    0.3477,    0.2876,
+    0.0303,    0.3370,    0.2915,    0.2493,
+    0.0298,    0.3080,    0.2493,    0.2192,
+    0.0293,    0.2851,    0.2170,    0.1950,
+    0.0290,    0.2666,    0.1919,    0.1754,
+    0.0286,    0.2514,    0.1718,    0.1592), ncol=4, byrow=TRUE)
+
+hw2_b_sensitivity_bel_mean = matrix(1e4 * c(
+    0.8887,    0.9490,    1.0458,    0.9990,
+    0.8912,    0.9624,    1.0425,    1.0006,
+    0.8935,    0.9740,    1.0368,    0.9991,
+    0.8954,    0.9842,    1.0302,    0.9960,
+    0.8971,    0.9932,    1.0236,    0.9922,
+    0.8986,    1.0010,    1.0172,    0.9881,
+    0.8999,    1.0076,    1.0113,    0.9839,
+    0.9011,    1.0133,    1.0058,    0.9799,
+    0.9021,    1.0180,    1.0008,    0.9761,
+    0.9029,    1.0220,    0.9963,    0.9725,
+    0.9036,    1.0254,    0.9922,    0.9691), ncol=4, byrow=TRUE)
+
+hw2_b_sensitivity_bel_median = matrix(1e3 * c(
+    6.9912,    2.9705,    3.6047,    3.6811,
+    7.1653,    3.4429,    4.1166,    4.2118,
+    7.3234,    3.8784,    4.5185,    4.6155,
+    7.4592,    4.2815,    4.8296,    4.9515,
+    7.5751,    4.6670,    5.0486,    5.2034,
+    7.6952,    5.0106,    5.2414,    5.4106,
+    7.7937,    5.3053,    5.3885,    5.5745,
+    7.8914,    5.5855,    5.5164,    5.7146,
+    7.9743,    5.8485,    5.6195,    5.8235,
+    8.0514,    6.0833,    5.7019,    5.9201,
+    8.1092,    6.2882,    5.7830,    6.0054), ncol=4, byrow=TRUE)
+
+hw2_b_sensitivity_bel_var = matrix(1e9 * c(
+    0.0600,    1.1760,    0.9842,    0.8754,
+    0.0517,    0.8907,    0.7145,    0.6240,
+    0.0450,    0.6918,    0.5598,    0.4807,
+    0.0394,    0.5508,    0.4619,    0.3909,
+    0.0348,    0.4494,    0.3954,    0.3305,
+    0.0310,    0.3745,    0.3477,    0.2876,
+    0.0277,    0.3178,    0.3121,    0.2558,
+    0.0249,    0.2741,    0.2846,    0.2314,
+    0.0225,    0.2397,    0.2629,    0.2122,
+    0.0205,    0.2122,    0.2453,    0.1968,
+    0.0187,    0.1901,    0.2308,    0.1841), ncol=4, byrow=TRUE)
+
+hw2_sigma_sensitivity_bel_mean = matrix(1e4 * c(
+    0.8952,    0.9604,    0.9898,    0.9740,
+    0.8959,    0.9680,    0.9968,    0.9781,
+    0.8965,    0.9759,    1.0032,    0.9816,
+    0.8972,    0.9841,    1.0087,    0.9844,
+    0.8979,    0.9924,    1.0134,    0.9866,
+    0.8986,    1.0010,    1.0172,    0.9881,
+    0.8994,    1.0096,    1.0203,    0.9890,
+    0.9002,    1.0184,    1.0225,    0.9894,
+    0.9010,    1.0272,    1.0239,    0.9892,
+    0.9018,    1.0360,    1.0243,    0.9884,
+    0.9026,    1.0449,    1.0238,    0.9870), ncol=4, byrow=TRUE)
+
+hw2_sigma_sensitivity_bel_median = matrix(1e3 * c(
+    7.7703,    5.8434,    7.5198,    7.5079,
+    7.7610,    5.6758,    7.1103,    7.1429,
+    7.7466,    5.5108,    6.6802,    6.7377,
+    7.7297,    5.3432,    6.2147,    6.3036,
+    7.7126,    5.1833,    5.7305,    5.8586,
+    7.6952,    5.0106,    5.2414,    5.4106,
+    7.6810,    4.8398,    4.7273,    4.9375,
+    7.6622,    4.6593,    4.2276,    4.4864,
+    7.6486,    4.4870,    3.7640,    4.0467,
+    7.6279,    4.3197,    3.3228,    3.6285,
+    7.6123,    4.1422,    2.8881,    3.2306), ncol=4, byrow=TRUE)
+
+hw2_sigma_sensitivity_bel_var = matrix(1e9 * c(
+    0.0275,    0.2021,    0.0724,    0.0674,
+    0.0282,    0.2289,    0.1002,    0.0909,
+    0.0288,    0.2591,    0.1377,    0.1220,
+    0.0295,    0.2932,    0.1884,    0.1630,
+    0.0302,    0.3316,    0.2565,    0.2169,
+    0.0310,    0.3745,    0.3477,    0.2876,
+    0.0317,    0.4224,    0.4694,    0.3800,
+    0.0324,    0.4757,    0.6305,    0.5003,
+    0.0332,    0.5352,    0.8419,    0.6558,
+    0.0340,    0.6012,    1.1166,    0.8553,
+    0.0348,    0.6746,    1.4688,    1.1088), ncol=4, byrow=TRUE)
+
+hw2_rho_sensitivity_bel_mean = matrix(1e4 * c(
+    0.8869,    0.9041,    0.9080,    0.8961,
+    0.8855,    0.9122,    0.9278,    0.9130,
+    0.8853,    0.9203,    0.9448,    0.9280,
+    0.8856,    0.9298,    0.9599,    0.9414,
+    0.8865,    0.9407,    0.9734,    0.9533,
+    0.8882,    0.9535,    0.9856,    0.9638,
+    0.8903,    0.9684,    0.9962,    0.9732,
+    0.8931,    0.9842,    1.0054,    0.9811,
+    0.8959,    0.9989,    1.0128,    0.9869,
+    0.8983,    1.0080,    1.0175,    0.9900,
+    0.8967,    0.9961,    1.0157,    0.9863), ncol=4, byrow=TRUE)
+
+hw2_rho_sensitivity_bel_man_discout_factor = matrix(c(
+    0.4124,    0.4122,    0.4141,    0.4132,
+    0.4114,    0.4092,    0.4163,    0.4150,
+    0.4107,    0.4080,    0.4180,    0.4166,
+    0.4103,    0.4082,    0.4198,    0.4183,
+    0.4104,    0.4098,    0.4216,    0.4202,
+    0.4109,    0.4131,    0.4235,    0.4221,
+    0.4118,    0.4179,    0.4252,    0.4240,
+    0.4132,    0.4239,    0.4267,    0.4257,
+    0.4147,    0.4301,    0.4279,    0.4271,
+    0.4161,    0.4344,    0.4282,    0.4276,
+    0.4150,    0.4262,    0.4252,    0.4244), ncol=4, byrow=TRUE)
+
+
+
+plot_sensitivity = function(sensitivity_data, title, subtitle, x, y) {
+  colnames(sensitivity_data) = c('base', 'stress AR(1)', 'stress Copula', 'stress naive')
+  sensitivity_data = sensitivity_data |>
+    cbind(rel_param_change = seq(-0.5, 0.5, by=0.1)) |>
+    as_tibble() |>
+    pivot_longer(
+      cols = -rel_param_change,
+      names_to = "scenario",
+      values_to = "bel"
+    )
+  
+  plot = ggplot(data = sensitivity_data, mapping = aes(x=rel_param_change, group=scenario, col=scenario, fill=scenario)) +
+  #geom_ribbon(aes(ymin = lower, ymax = upper), alpha=0.2) +
+  geom_line(aes(y = bel), linewidth=0.6)
+plot = plot +
+  labs(
+    title = title,
+    subtitle = subtitle,
+    x = x,
+    y = y
+  ) +
+  theme(
+    plot.subtitle = element_markdown()
+  )
+  
+  return (plot)
+}
+
+p1 = plot_sensitivity(hw2_a_sensitivity_bel_mean,
+                 title = TeX('Mean of BEL for changes in G2++ parameter $a$'),
+                 subtitle = 'based on 10 000 realizations for distinct G2++ calibrations',
+                 x = TeX('relative change of G2++ parameter $a$'),
+                 y = 'mean of BEL')
+p2 = plot_sensitivity(hw2_a_sensitivity_bel_median,
+                 title = TeX('Median of BEL for changes in G2++ parameter $a$'),
+                 subtitle = 'based on 10 000 realizations for distinct G2++ calibrations',
+                 x = TeX('relative change of G2++ parameter $a$'),
+                 y = 'median of BEL')
+p3 = plot_sensitivity(hw2_a_sensitivity_bel_var,
+                 title = TeX('Variance of BEL for changes in G2++ parameter $a$'),
+                 subtitle = 'based on 10 000 realizations for distinct G2++ calibrations',
+                 x = TeX('relative change of G2++ parameter $a$'),
+                 y = 'variance of BEL')
+
+p4 = plot_sensitivity(hw2_b_sensitivity_bel_mean,
+                 title = TeX('Mean of BEL for changes in G2++ parameter $b$'),
+                 subtitle = 'based on 10 000 realizations for distinct G2++ calibrations',
+                 x = TeX('relative change of G2++ parameter $b$'),
+                 y = 'mean of BEL')
+p5 = plot_sensitivity(hw2_b_sensitivity_bel_median,
+                 title = TeX('Median of BEL for changes in G2++ parameter $b$'),
+                 subtitle = 'based on 10 000 realizations for distinct G2++ calibrations',
+                 x = TeX('relative change of G2++ parameter $b$'),
+                 y = 'median of BEL')
+p6 = plot_sensitivity(hw2_b_sensitivity_bel_var,
+                 title = TeX('Variance of BEL for changes in G2++ parameter $b$'),
+                 subtitle = 'based on 10 000 realizations for distinct G2++ calibrations',
+                 x = TeX('relative change of G2++ parameter $b$'),
+                 y = 'variance of BEL')
+
+p7 = plot_sensitivity(hw2_sigma_sensitivity_bel_mean,
+                 title = TeX('Mean of BEL for changes in G2++ parameter $\\sigma$'),
+                 subtitle = 'based on 10 000 realizations for distinct G2++ calibrations',
+                 x = TeX('relative change of G2++ parameter $\\sigma$'),
+                 y = 'mean of BEL')
+p8 = plot_sensitivity(hw2_sigma_sensitivity_bel_median,
+                 title = TeX('Median of BEL for changes in G2++ parameter $\\sigma$'),
+                 subtitle = 'based on 10 000 realizations for distinct G2++ calibrations',
+                 x = TeX('relative change of G2++ parameter $\\sigma$'),
+                 y = 'median of BEL')
+p9 = plot_sensitivity(hw2_sigma_sensitivity_bel_var,
+                 title = TeX('Variance of BEL for changes in G2++ parameter $\\sigma$'),
+                 subtitle = 'based on 10 000 realizations for distinct G2++ calibrations',
+                 x = TeX('relative change of G2++ parameter $\\sigma$'),
+                 y = 'variance of BEL')
+
+ggarrange(p1, p4, p2, p5, p3, p6, nrow=3, ncol=2, common.legend=TRUE, legend='bottom')
+
+ggarrange(p7, p9, nrow=1, ncol=2, common.legend=TRUE, legend='bottom')
+
+p10 = plot_sensitivity(hw2_rho_sensitivity_bel_mean,
+                 title = TeX('Mean of BEL for changes in G2++ parameter $\\rho$'),
+                 subtitle = 'based on 10 000 realizations for distinct G2++ calibrations',
+                 x = TeX('value of G2++ parameter $\\rho$'),
+                 y = 'mean of BEL')
+
+p11 = plot_sensitivity(hw2_rho_sensitivity_bel_man_discout_factor,
+                 title = TeX('Mean of discount factors for changes in G2++ parameter $\\rho$'),
+                 subtitle = 'based on 10 000 realizations for distinct G2++ calibrations',
+                 x = TeX('value of G2++ parameter $\\rho$'),
+                 y = 'mean of discount factors')
+ggarrange(p10, p11, nrow=1, ncol=2, common.legend=TRUE, legend='bottom')
+
+
+```
+

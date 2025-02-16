@@ -1,0 +1,987 @@
+---
+title: "Swaptions: Dynamics of implied volatility surfaces"
+author: "David Neuhäusler"
+date: "February 2025"
+site: bookdown::bookdown_site
+documentclass: book
+description: |
+  R scripts for the master's thesis 'Dynamics of implied swaption volatility  surfaces and implications on life insurers under Solvency II' at Ulm University
+link-citations: yes
+---
+
+```{r, setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE, warning = FALSE
+)
+```
+
+```{r load_packages, include=TRUE}
+library(MASS)
+library(tidyverse) # functions for data visualization
+library(factoextra) # functions for multivariate data analyses
+library(plotly) # plot library
+library(lubridate) # date helper functions
+library(patchwork) # simple layouts for ggplot2
+library(ggpubr) # simple layouts for ggplot2
+library(ggExtra) # extend ggplot2 toolset
+library(ggpubr) # customize ggplot2 plots
+library(ggtext) # simple Markdown and HTML rendering for ggplot2
+library(glue) # R expression embedding for strings
+library(formattable) # formatter functions
+library(latex2exp) # use LaTeX in plots
+library(tseries) # time series analysis and computational finance
+library(pracma) # practical numerical math functions
+library(zoo) # time series utils
+library(pander) # output formatting of tibbles and data frames
+library(timetk) # filter date and time expressions
+library(dplyr) # data manipulation
+library(ggcorrplot) # plot covariance matrices
+library(copula) # copulas
+library(quantreg) # quantile regression
+library(Sim.DiffProc)
+library(mice) # imputation of missing values
+```
+
+```{r configure_theme, include=FALSE}
+theme_set(theme_minimal() %+replace%
+  theme(
+    # plot title
+    plot.title = element_text(
+      size = rel(1.3), face = "bold",
+      margin = margin(0, 0, 5, 0), hjust = 0
+    ),
+    # plot panel
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    # axes
+    axis.title = element_text(size = rel(0.85), face = "bold"),
+    axis.text = element_text(size = rel(0.85), face = "bold"),
+    axis.line = element_line(color = "black"),
+    # legend
+    legend.title = element_text(size = rel(0.85), face = "bold"),
+    legend.text = element_text(size = rel(0.70), face = "bold"),
+    legend.key = element_rect(fill = "transparent", colour = NA),
+    legend.key.size = unit(1.5, "lines"),
+    legend.background = element_rect(fill = "transparent", colour = NA),
+    # plot facets
+    strip.background = element_rect(fill = "black", color = "black"),
+    strip.text = element_text(
+      size = rel(0.85), face = "bold", color = "white",
+      margin = margin(5, 0, 5, 0)
+    )
+  ))
+colors <- c(
+  "#000000", "#555555", "#999999",
+  "#0072B2", "#009E73", "#E69F00", "#D55E00",
+  "#F0E442", "#CC79A7", "#56B4E9"
+)
+names(colors) <- c(
+  "black", "gray", "lightgray", "blue", "green",
+  "orange", "red", "yellow", "magenta", "lightblue"
+)
+```
+
+# Volatility stress scenarios
+## Helper functions
+```{r helper_functions}
+# convert matrix to column vector
+impl_vol_row_to_matrix <- function(vector) {
+  # option periods different across cols
+  # swap periods different across rows
+  return(matrix(as.numeric(vector), nrow = 5, byrow = FALSE))
+}
+
+# visualize 5x5 surface plot
+plotly_3d <- function(vectors, title, name_z_axis = "implied volatility") {
+  surface_plot <- plot_ly()
+  n_planes <- 1
+  if (!is.vector(vectors)) {
+    n_planes <- ncol(vectors)
+  }
+  colorscales <- c("Rainbow", "YlGnBu", "Hot", "Jet", "Picnic", "Portland", "RdBu", "Reds", "Viridis", "YlOrRd", "Earth")
+  for (i in 1:n_planes) {
+    if (n_planes == 1) {
+      matrix <- impl_vol_row_to_matrix(vectors)
+    } else {
+      matrix <- impl_vol_row_to_matrix(vectors[, i])
+    }
+
+    surface_plot <- surface_plot |> add_surface(
+      x = seq(5, 25, 5), y = seq(5, 25, 5), z = matrix,
+      contours = list(
+        x = list(show = TRUE),
+        y = list(show = TRUE),
+        z = list(
+          show = TRUE,
+          usecolormap = TRUE
+          # project=list(z=TRUE)
+        )
+      ),
+      opacity = 0.6,
+      colorscale = colorscales[i],
+      colorbar = list(title = colnames(vectors)[i])
+    )
+  }
+
+  surface_plot <- surface_plot |>
+    layout(
+      title = title,
+      scene = list(
+        xaxis = list(
+          title = "option period",
+          tickvals = seq(5, 25, 5)
+        ),
+        yaxis = list(
+          title = "swap tenor",
+          tickvals = seq(5, 25, 5)
+        ),
+        zaxis = list(
+          title = name_z_axis
+        ),
+        camera = list(
+          eye = list(x = 1.8, y = 1.8, z = -0.5)
+        )
+      )
+    )
+  return(surface_plot)
+}
+```
+
+```{r projection_on_principal_components}
+# determine joint quantiles using quantile regressions
+determine_joint_quantile <- function(three_dim_obs, quantile_lvl) {
+  colnames(three_dim_obs) <- c("pc1", "pc2", "pc3")
+  three_dim_obs <- three_dim_obs[rowSums(abs(three_dim_obs) > 10) == 0, ]
+
+  q1 <- quantile(three_dim_obs$pc1, probs = quantile_lvl)
+  summary(q1) |> print()
+  quantile_regression_1 <- rq(pc2 ~ ., tau = quantile_lvl, data = three_dim_obs |> select(-pc3))
+  summary(quantile_regression_1) |> print()
+  q2 <- predict(quantile_regression_1, newdata = tibble(pc1 = q1))
+  quantile_regression_2 <- rq(pc3 ~ ., tau = quantile_lvl, data = three_dim_obs)
+  summary(quantile_regression_2) |> print()
+  q3 <- predict(quantile_regression_2, newdata = tibble(pc1 = q1, pc2 = q2))
+
+  # Define the vertical plane x = 2 (for example)
+  x <- seq(min(three_dim_obs$pc1), max(three_dim_obs$pc1, q1), length.out = 10)
+  y <- seq(min(three_dim_obs$pc2), max(three_dim_obs$pc2, q2), length.out = 10)
+  z <- seq(min(three_dim_obs$pc3), max(three_dim_obs$pc3, q3), length.out = 10)
+  xy <- meshgrid(x, y)
+
+  plot <- plot_ly(three_dim_obs, x = ~pc1, y = ~pc2, z = ~pc3, type = "scatter3d", name = "observations") |>
+    # quantile of pc1
+    add_surface(
+      x = matrix(q1, nrow = length(y), ncol = length(z)),
+      y = matrix(y, nrow = length(y), ncol = length(z)),
+      z = matrix(z, nrow = length(y), ncol = length(z), byrow = TRUE),
+      opacity = 0.5, showscale = FALSE
+    ) |>
+    # quantile regression line pc2 ~ pc1
+    add_surface(
+      x = matrix(x, nrow = length(y), ncol = length(z)),
+      y = matrix(coef(quantile_regression_1)[1] + coef(quantile_regression_1)[2] * x, nrow = length(y), ncol = length(z)),
+      z = matrix(z, nrow = length(y), ncol = length(z), byrow = TRUE),
+      opacity = 0.5, showscale = FALSE
+    ) |>
+    # quantile regression line pc3 ~ pc2 + pc1
+    add_surface(
+      x = x,
+      y = y,
+      z = coef(quantile_regression_2)[1] + coef(quantile_regression_2)[2] * xy$X + coef(quantile_regression_2)[3] * xy$Y,
+      opacity = 0.5, showscale = FALSE
+    ) |>
+    # joint quantile
+    add_trace(x = q1, y = q2, z = q3, name = "joint quantile") |>
+    layout(
+      title = paste0("Joint ", quantile_lvl * 100, "% quantile"),
+      xaxis = list(
+        title = "pc1 scores",
+        range = list(-2, 7)
+      ),
+      yaxis = list(
+        title = "pc2 scores",
+        range = list(-1, 2.5)
+      ),
+      zaxis = list(
+        title = "pc3 scores",
+        range = list(-1.4, 2.5)
+      )
+    )
+
+  return(list(
+    joint_quantile = c(q1, q2, q3),
+    plot = plot,
+    three_dim_obs = three_dim_obs
+  ))
+}
+
+# visualize and annualize principal component analysis results
+principal_component_viz <- function(pca, # prcomp class
+                                    data,
+                                    order_number_max,
+                                    with_plots = FALSE,
+                                    quantile_lvl = 0.995,
+                                    is_weekly = TRUE) {
+  pc_scores_copula <- tibble() # annualized principal component projection scores using Copula method
+  pc_scores_ar <- tibble() # annualized principal component projection scores using AR(1) method
+  month_names <- c("Jan", "Feb", "Mar", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez")
+
+  plots_annualized_copula <- list()
+  plots_annualized_ar <- list()
+
+  for (order_number in 1:order_number_max) {
+    order_text <- ""
+    if (order_number == 1) {
+      order_text <- "first"
+    } else if (order_number == 2) {
+      order_text <- "second"
+    } else if (order_number == 3) {
+      order_text <- "third"
+    }
+
+    if (with_plots) {
+      # plot principal component surface of implied volatilities
+      plotly_3d(
+        pca$rotation[, paste0("PC", order_number)] |> as.numeric(),
+        paste0(
+          toupper(substr(order_text, 1, 1)), substr(order_text, 2, 100),
+          " principal component surface of changes in implied volatilities"
+        )
+      ) |> print()
+    }
+
+    # save projection scores
+    df_pc_projection <- tibble(
+      timestamp = data$Timestamp,
+      projection = NA
+    )
+
+    for (i in 1:nrow(data)) {
+      df_pc_projection$projection[i] <- sum(
+        data[i, -1] * pca$rotation[, paste0("PC", order_number)]
+      )
+    }
+    df_pc_projection <- df_pc_projection |>
+      arrange(timestamp) |>
+      mutate(
+        # week = strftime(timestamp, format = "%V"),
+        month = month(timestamp),
+        year = year(timestamp)
+      )
+
+    if (with_plots) {
+      upper_quantile <- quantile(df_pc_projection$projection, quantile_lvl)
+      # histogram of all observed principal component scores
+      plot <- ggplot(data = df_pc_projection, aes(x = projection)) +
+        geom_histogram(aes(y = ..density..)) +
+        geom_density(colour = "blue", linewidth = 0.8) +
+        geom_vline(aes(xintercept = upper_quantile), linewidth = 0.8, linetype = "dashed", colour = "darkgreen") +
+        annotate(geom = "text", x = upper_quantile, y = 0.3, hjust = -0.1, label = formatC(upper_quantile, 4), color = "darkgreen") +
+        annotate(
+          geom = "text", x = -Inf, y = Inf, hjust = 1, vjust = 1,
+          label = TeX(paste0(
+            "$\\hat{\\mu}$ = ", formatC(mean(df_pc_projection$projection), digits = 4),
+            ", $\\hat{\\sigma}^2$ = ", formatC(var(df_pc_projection$projection), digits = 4)
+          ))
+        ) +
+        labs(
+          title = paste0("Histogram of ", order_text, " principal component scores"),
+          subtitle = paste0(""),
+          x = "principal component score",
+          y = "density"
+        )
+      print(plot)
+    }
+
+    # fit normal distribution for principal component scores (monthly frequency)
+    pc_scores_distr <- fitdistr(df_pc_projection$projection, "t")$estimate
+    print(pc_scores_distr)
+
+    df_pc_projection_wide <- df_pc_projection
+    for (i in 1:ifelse(is_weekly, 51, 11)) {
+      df_pc_projection_wide <- df_pc_projection_wide |>
+        mutate(
+          "lag{{i}}" := lag(projection, i)
+        )
+    }
+
+    df_pc_projection_wide <- df_pc_projection_wide |>
+      select(-timestamp, -month, -year) |>
+      drop_na()
+    colnames(df_pc_projection_wide) <- paste0("lag_", 0:ifelse(is_weekly, 51, 11))
+
+    if (with_plots) {
+      # histogram of all observed principal component scores grouped by month
+      plot <- ggplot(data = gather(df_pc_projection_wide), aes(x = value)) +
+        geom_histogram(aes(y = ..density..)) +
+        geom_density(colour = "blue", linewidth = 0.8) +
+        facet_wrap(~key, scales = "free") +
+        labs(
+          title = paste0("Histogram of ", order_text, " principal component scores"),
+          subtitle = paste0("Groups by month"),
+          x = "principal component score",
+          y = "density"
+        )
+      print(plot)
+    }
+
+    nsim <- 100000
+    ##############################################################################
+    # 1) Annualization: Monthly simulations using Copula #########################
+    ##############################################################################
+    if (with_plots) {
+      # covariance matrix of projection scores
+      pc_scores_cov <- df_pc_projection_wide |>
+        cor(use = "pairwise.complete.obs") |>
+        ggcorrplot() +
+        labs(
+          title = paste0(
+            "Autocorrelation matrix of observed ", ifelse(is_weekly, "weekly", "monthly"),
+            " principal component scores"
+          )
+        ) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+      print(pc_scores_cov)
+    }
+
+    set.seed(1)
+    # fit 12 dimensional normal copula and simulate from it
+    # normcop = normalCopula(dim = ncol(df_pc_projection_wide), dispstr='toep')
+    normcop <- tCopula(dim = ncol(df_pc_projection_wide), dispstr = "toep", df.fixed = FALSE)
+    fit <- fitCopula(normcop, pobs(as.matrix(df_pc_projection_wide)), method = "mpl")
+    print(fit@estimate)
+    simulations <- rCopula(nsim, tCopula(fit@estimate[-length(fit@estimate)], df = fit@estimate[length(fit@estimate)], dim = ncol(df_pc_projection_wide), dispstr = "toep"))
+
+    if (with_plots) {
+      # 2d marginals of observed scores
+      plot_obs <- ggplot(tibble(x = pt((pca$x[1:597, "PC1"] - 0.0004) / 0.0607, df = 3.173), y = pt((pca$x[2:598, "PC1"] - 0.0004) / 0.0607, df = 3.173)), aes(x, y)) +
+        geom_point() +
+        labs(
+          title = "Observations of lag_0 and lag_1 scores",
+          subtitle = "Dependence structure of 598 weekly first principal component scores",
+          x = TeX("$F_{(\\mu,\\tau,\\nu)}(x_{i})$ of lag_0 observations $x_i$"),
+          y = TeX("$F_{(\\mu,\\tau,\\nu)}(x_{i})$ of lag_1 observation $x_i$")
+        )
+      # 2d marginals of copula simulations
+      plot_sim <- ggplot(tibble(x = simulations[1:597, 1], y = simulations[1:597, 2]), aes(x, y)) +
+        geom_point() +
+        labs(
+          title = "Simulation of dependent lag_0 and lag_1 scores",
+          subtitle = "Dependence structure of 598 t Copula marginals",
+          x = "marginal uniform distribution of lag_0",
+          y = "marginal uniform distribution of lag_1"
+        )
+      print(ggarrange(ggMarginal(plot_obs, type = "density"), ggMarginal(plot_sim, type = "density"), nrow = 1))
+      print(paste("Correlation small: ", cor(
+        qt(simulations[1:597, 1], df = pc_scores_distr["df"]) * pc_scores_distr["s"] + pc_scores_distr["m"],
+        qt(simulations[1:597, 2], df = pc_scores_distr["df"]) * pc_scores_distr["s"] + pc_scores_distr["m"]
+      )))
+      print(paste("Correlation large: ", cor(
+        qt(simulations[, 1], df = pc_scores_distr["df"]) * pc_scores_distr["s"] + pc_scores_distr["m"],
+        qt(simulations[, 2], df = pc_scores_distr["df"]) * pc_scores_distr["s"] + pc_scores_distr["m"]
+      )))
+    }
+
+    # re-transform uniform copula estimates to empirical marginal distribution
+    for (colIndex in 1:ncol(simulations)) {
+      # simulations[,colIndex] = quantile(ecdf(df_pc_projection_wide[[colIndex]]), simulations[,colIndex])
+      # simulations[,colIndex] = qnorm(simulations[,colIndex], mean = pc_scores_distr['mean'], sd = pc_scores_distr['sd'])
+      simulations[, colIndex] <- qt(simulations[, colIndex], df = pc_scores_distr["df"]) * pc_scores_distr["s"] + pc_scores_distr["m"]
+    }
+    simulations <- as_tibble(simulations)
+    colnames(simulations) <- colnames(df_pc_projection_wide)
+
+    # 2d marginals of copula simulations
+    plot <- ggplot(tibble(x = simulations$lag_0, y = simulations$lag_1), aes(x, y)) +
+      geom_point() +
+      labs(
+        title = "Simulation of dependent lag_0 and lag_1 scores",
+        subtitle = "Excerpt of a 52-dimensional t Copula",
+        x = "lag_0",
+        y = "lag_1"
+      )
+    print(ggMarginal(plot, type = "density"))
+
+    if (with_plots) {
+      # covariance matrix of simulations
+      pc_scores_cov <- simulations |>
+        cor(use = "pairwise.complete.obs") |>
+        ggcorrplot() +
+        labs(
+          title = paste0("Autocorrelation matrix of observed ", ifelse(is_weekly, "weekly", "monthly"))
+        )
+      print(pc_scores_cov)
+
+      # histogram of simulated principal component scores grouped by month
+      plot <- ggplot(data = gather(simulations), aes(x = value)) +
+        geom_histogram(aes(y = ..density..)) +
+        geom_density(colour = "blue", linewidth = 0.8) +
+        facet_wrap(~key, scales = "free") +
+        labs(
+          title = paste0("Histogram of ", order_text, " principal component simulated scores"),
+          subtitle = paste0("Groups by month"),
+          x = "simulation",
+          y = "density"
+        )
+      print(plot)
+    }
+
+    # Annualized monthly simulations
+    annualized_simulations_copula <- apply(1 + simulations, 1, prod) - 1
+    upper_quantile_copula <- quantile(annualized_simulations_copula, quantile_lvl, na.rm = TRUE)
+    # remove outliers for histogram
+    annualized_simulations_copula_hist <- annualized_simulations_copula[order(annualized_simulations_copula, decreasing = TRUE)[-(1:40)]]
+    annualized_simulations_copula_hist <- annualized_simulations_copula_hist[order(annualized_simulations_copula_hist, decreasing = FALSE)[-(1:40)]]
+    if (with_plots) {
+      plot <- ggplot(data = tibble(value = annualized_simulations_copula_hist), aes(x = value)) +
+        geom_histogram(aes(y = ..density..)) +
+        # geom_line(aes(y = dnorm(value, mean = mean(annualized_simulations_copula), sd = sqrt(var(annualized_simulations_copula))))) +
+        geom_density(colour = "blue", linewidth = 0.8) +
+        geom_vline(aes(xintercept = upper_quantile_copula), linewidth = 0.8, linetype = "dashed", colour = "darkgreen") +
+        annotate(geom = "text", x = upper_quantile_copula, y = 0.3, hjust = -0.1, label = formatC(upper_quantile_copula, 4), color = "darkgreen") +
+        # annotate(geom = "text", x = -Inf, y = Inf, hjust=0, vjust=1,
+        #          label = TeX(paste0("$\\hat{\\mu}$ = ", formatC(mean(annualized_simulations_copula), digits=4),
+        #             ", $\\hat{\\sigma}^2$ = ", formatC(var(annualized_simulations_copula), digits=4)))) +
+        labs(
+          title = paste0("Histogram of ", order_text, " principal component annualized simulated scores"),
+          subtitle = paste0("Annualization performed using Copula simulations"),
+          x = "simulation",
+          y = "density"
+        )
+      print(plot)
+      plots_annualized_copula[[order_number]] <- plot
+    }
+
+    ##############################################################################
+    # 2) Annualization: Monthly simulations using AR(1) process ##################
+    ##############################################################################
+    if (with_plots) {
+      plot_projection <- ggplot() +
+        geom_line(data = df_pc_projection, mapping = aes(timestamp, projection)) +
+        labs(
+          title = paste0("Scores of ", order_text, " principal component"),
+          x = "time",
+          y = ""
+        )
+      print(order_text)
+      print(plot_projection)
+    }
+
+    acf <- acf(df_pc_projection$projection, lag.max = 50, plot = FALSE)
+    df_acf <- with(acf, data.frame(lag, acf))
+
+    if (with_plots) {
+      conf.level <- 0.95
+      ciline <- qnorm((1 - conf.level) / 2) / sqrt(length(df_pc_projection$projection))
+      plot_acf <- ggplot(data = df_acf, mapping = aes(x = lag, y = acf)) +
+        geom_line() +
+        labs(
+          title = paste0("Autocorrelation function of ", order_text, " principal component"),
+          x = "Lag (weeks)",
+          y = ""
+        )
+    }
+
+    pacf <- pacf(df_pc_projection$projection, lag.max = 50, plot = FALSE)
+    pdf_acf <- with(pacf, data.frame(lag, acf))
+
+    if (with_plots) {
+      plot_pacf <- ggplot(data = pdf_acf, mapping = aes(x = lag, y = acf)) +
+        geom_hline(aes(yintercept = 0)) +
+        geom_segment(mapping = aes(xend = lag, yend = 0)) +
+        geom_hline(aes(yintercept = ciline), linetype = 2, color = "darkblue") +
+        geom_hline(aes(yintercept = -ciline), linetype = 2, color = "darkblue") +
+        labs(
+          title = paste0("Sample partial autocorrelation function of ", order_text, " principal component"),
+          x = "Lag (weeks)",
+          y = "Sample partial autocorrelations"
+        )
+      print(plot_acf / plot_pacf)
+    }
+    
+    # fit AR(1) model to principal component scores time series
+    projection_score_time_series <- ar(df_pc_projection$projection, order.max = 1, aic = FALSE)
+    sigma <- var(projection_score_time_series$resid[-1]) |> sqrt()
+    print(projection_score_time_series)
+    print(paste("AR(1)-process: sigma = ", sigma))
+    plot_ar1_residuals_time <- ggplot(
+      data = tibble(time = df_pc_projection$timestamp[-1], residuals = projection_score_time_series$resid[-1]),
+      mapping = aes(x = time, y = residuals)
+    ) +
+      geom_line() +
+      labs(
+        title = "Time series plot of residuals of AR(1) process",
+        subtitle = paste0(order_text, " principal component"),
+        x = "time",
+        y = "residual"
+      )
+    plot_ar1_residuals_hist <- ggplot(
+      data = tibble(time = df_pc_projection$timestamp[-1], residuals = projection_score_time_series$resid[-1]),
+      mapping = aes(x = residuals)
+    ) +
+      geom_histogram() +
+      geom_rug() +
+      labs(
+        title = "Histogram of residuals of fitted AR(1) process",
+        subtitle = paste0(order_text, " principal component"),
+        x = "residual",
+        y = "frequency"
+      )
+    plot_ar1_residuals_qq <- ggplot(tibble(residuals = projection_score_time_series$resid[-1]), aes(sample = residuals)) +
+      stat_qq() +
+      stat_qq_line() +
+      labs(
+        title = "QQ-plot: Residuals of fitted AR(1) process",
+        subtitle = "Quantiles of residuals vs normal distribution",
+        x = "theoretical quantile",
+        y = "sample quantile"
+      )
+    print(plot_ar1_residuals_time | plot_ar1_residuals_hist | plot_ar1_residuals_qq)
+
+    # simulate AR(1) time series and estimate annual rate of change
+    set.seed((order_number - 1) * nsim + 1)
+    annualized_simulations_ar <- numeric(nsim)
+    for (i in 1:nsim) {
+      annualized_simulations_ar[i] <- (1 + arima.sim(n = ifelse(is_weekly, 52, 12), model = list(order = c(1, 0, 0), ar = projection_score_time_series$ar), sd = sigma)) |>
+        prod()
+    }
+    annualized_simulations_ar <- annualized_simulations_ar - 1
+    upper_quantile_ar <- quantile(annualized_simulations_ar, quantile_lvl, na.rm = TRUE)
+    # remove outliers for histogram
+    annualized_simulations_ar_hist <- annualized_simulations_ar[order(annualized_simulations_ar, decreasing = TRUE)[-(1:40)]]
+    annualized_simulations_ar_hist <- annualized_simulations_ar_hist[order(annualized_simulations_ar_hist, decreasing = FALSE)[-(1:40)]]
+    if (with_plots) {
+      plot <- ggplot(data = tibble(value = annualized_simulations_ar_hist), aes(x = value)) +
+        geom_histogram(aes(y = ..density..)) +
+        # geom_line(aes(y = dnorm(value, mean = mean(annualized_simulations_ar), sd = sqrt(var(annualized_simulations_ar))))) +
+        geom_density(colour = "blue", linewidth = 0.8) +
+        geom_vline(aes(xintercept = as.numeric(upper_quantile_ar)), linewidth = 0.8, linetype = "dashed", colour = "darkgreen") +
+        annotate(geom = "text", x = upper_quantile_ar, y = 0.2, hjust = 0, label = formatC(upper_quantile_ar, 4), color = "darkgreen") +
+        # annotate(geom = "text", x = -Inf, y = Inf, hjust=0, vjust=1,
+        #          label = TeX(paste0("$\\hat{\\mu}$ = ", formatC(mean(annualized_simulations_ar), digits=4),
+        #             ", $\\hat{\\sigma}^2$ = ", formatC(var(annualized_simulations_ar), digits=4)))) +
+        labs(
+          title = paste0("Histogram of ", order_text, " principal component annualized simulated scores"),
+          subtitle = paste0("Annualization performed using AR(1) time series simulations"),
+          x = "simulation",
+          y = "density"
+        )
+      print(plot)
+      plots_annualized_ar[[order_number]] <- plot
+    }
+    # cbind projections scores to pc_scores
+    if (ncol(pc_scores_ar) > 0) {
+      pc_scores_copula <- pc_scores_copula |> cbind(annualized_simulations_copula)
+      pc_scores_ar <- pc_scores_ar |> cbind(annualized_simulations_ar)
+    } else {
+      pc_scores_copula <- tibble(annualized_simulations_copula)
+      pc_scores_ar <- tibble(annualized_simulations_ar)
+    }
+  }
+  print(pc_scores_ar)
+  # Determine joint quantile at level quantile_lvl
+  joint_quantile_copula <- determine_joint_quantile(pc_scores_copula, quantile_lvl)
+  joint_quantile_ar <- determine_joint_quantile(pc_scores_ar, quantile_lvl)
+  print(joint_quantile_copula$plot)
+  print(joint_quantile_ar$plot)
+
+
+  if (with_plots) {
+    print((plots_annualized_copula[[1]] | plots_annualized_ar[[1]]) /
+      (plots_annualized_copula[[2]] | plots_annualized_ar[[2]]) /
+      (plots_annualized_copula[[3]] | plots_annualized_ar[[3]]))
+  }
+
+  return(list(
+    joint_quantile_copula = joint_quantile_copula, # $joint_quantile,
+    joint_quantile_ar = joint_quantile_ar # $joint_quantile
+  ))
+}
+```
+
+```{r function_time_series_plot}
+# Function to scale secondary axis
+scale_function <- function(x, scale, shift) {
+  return((x - shift) * scale)
+}
+
+# Function to scale secondary variable values
+inv_scale_function <- function(x, scale, shift) {
+  return(x / scale + shift)
+}
+
+plot_grouped_implied_volatilities <- function(impl_vol, additional_time_series) {
+  data <- impl_vol
+
+  time_series_colnames <- c()
+  if (!is.null(additional_time_series)) {
+    data <- impl_vol |>
+      left_join(additional_time_series, by = join_by(Timestamp))
+
+    time_series_colnames <- colnames(additional_time_series[, -1])
+
+    # max of first y axis
+    max_y_first <- max(impl_vol[, -1])
+    max_y_second <- max(additional_time_series[, -1], na.rm = TRUE) # max of second y axis
+    min_y_first <- min(impl_vol[, -1]) # min of first y axis
+    min_y_second <- min(additional_time_series[, -1], na.rm = TRUE) # min of second y axis
+
+    # scale and shift variables calculated based on desired mins and maxes
+    scale <- (max_y_second - min_y_second) / (max_y_first - min_y_first)
+    shift <- mean(min_y_first - min_y_second, max_y_first - max_y_second)
+  } else {
+    scale <- 1
+    shift <- 0
+  }
+
+  data_long <- data |>
+    pivot_longer(
+      cols = -Timestamp,
+      names_to = "swaption",
+      values_to = "value"
+    )
+
+  plt <- ggplot() +
+    geom_line(
+      data = data_long |> filter(!(swaption %in% time_series_colnames)),
+      mapping = aes(x = Timestamp, y = value, color = swaption), linewidth = 0.6
+    ) +
+    # annotate(geom = "rect", xmin = ymd("2024-07-01"), xmax = ymd("2024-07-15"), ymin = -Inf, ymax = Inf, fill = colors["green"], alpha = 0.2) +
+    # annotate(geom = "rect", xmin = ymd("2019-12-01"), xmax = ymd("2019-12-31"), ymin = -Inf, ymax = Inf, fill = colors["green"], alpha = 0.2) +
+    # annotate(geom = "rect", xmin = ymd("2019-05-01"), xmax = ymd("2019-05-30"), ymin = -Inf, ymax = Inf, fill = colors["green"], alpha = 0.2) +
+    annotate(geom = "rect", xmin = ymd("2015-05-01"), xmax = ymd("2015-06-01"), ymin = -Inf, ymax = Inf, fill = colors["green"], alpha = 0.2) +
+    annotate(geom = "rect", xmin = ymd("2020-03-01"), xmax = ymd("2020-04-01"), ymin = -Inf, ymax = Inf, fill = colors["green"], alpha = 0.2)
+
+  if (!is.null(additional_time_series)) {
+    plt <- plt +
+      geom_line(
+        data = data_long |> filter(swaption %in% time_series_colnames),
+        mapping = aes(x = Timestamp, y = inv_scale_function(value, scale, shift), colour = "interest_rate"),
+        color = "gray20"
+      ) +
+      scale_y_continuous(
+        name = "implied volatility",
+        # limits = c(min_y_first, max_y_first),
+        sec.axis = sec_axis(
+          ~ scale_function(., scale, shift),
+          name = "interest rate",
+          labels = waiver()
+        )
+      )
+  }
+  plt <- plt +
+    scale_color_manual(values = c("20YX5Y" = "red", "interest_rate" = "gray20")) +
+    labs(
+      title = "Implied volatility for swaptions with same option period",
+      subtitle = paste0("Swaptions from 2/7/2013 to 9/9/2024"),
+      x = "date"
+    ) +
+    theme(
+      axis.title.y = element_markdown(color = "black"),
+      axis.title.y.right = element_markdown(color = colors["gray20"])
+    )
+  return(plt)
+}
+```
+
+## Observations: Daily implied volatilities
+```{r load_data}
+set.seed(1)
+
+swaption_volatilities_d <- read_csv("../data_raw/swaption_volatilities.csv")
+swaption_volatilities_d$Timestamp <- mdy(swaption_volatilities_d$Timestamp)
+
+# Count NA rows
+paste0(
+  "Number of NA rows: ",
+  swaption_volatilities_d |> count() |> as.numeric() -
+    swaption_volatilities_d |> drop_na() |> count() |> as.numeric()
+)
+swaption_volatilities_d <- swaption_volatilities_d |>
+  drop_na() |>
+  filter(Timestamp != ymd("2015-05-04"))
+# 24 rows in April 2015 contain missing implied volatilities. These observations are removed.
+
+swaption_volatilities_d |>
+  select(-Timestamp) |>
+  cor(use = "pairwise.complete.obs") |>
+  ggcorrplot() +
+  labs(
+    title = paste0("Correlation of implied swaption volatilities"),
+    subtitle = "Daily data from 2/7/2013 to 9/9/2024"
+  )
+
+swaption_volatilities_d_corr <- swaption_volatilities_d |>
+  select(-Timestamp) |>
+  cor(use = "pairwise.complete.obs")
+
+# ggplot of pairwise correlations in swaption volatilities
+swaption_volatilities_d_corr <-
+  tibble(
+    value = swaption_volatilities_d_corr[upper.tri(swaption_volatilities_d_corr)]
+  )
+
+ggplot(data = gather(swaption_volatilities_d_corr), aes(x = value, y = factor(""))) +
+  geom_violin() +
+  geom_boxplot(width = 0.4) +
+  labs(
+    title = paste0("Pairwise correlations of implied swaption volatilities"),
+    subtitle = paste0("daily historical data of 25 swaptions from 2/7/2013 to 9/9/2024"),
+    x = "Pearson correlation",
+    y = ""
+  )
+
+# relative change in daily swaption volatilities
+n <- nrow(swaption_volatilities_d)
+swaption_volatilities_d_rel <- (swaption_volatilities_d[1:(n - 1), -1] /
+  swaption_volatilities_d[2:n, -1] - 1) |>
+  cbind(Timestamp = swaption_volatilities_d$Timestamp[1:(n - 1)])
+
+# relative change in monthly swaption volatilities
+swaption_volatilities_m <- swaption_volatilities_d |>
+  group_by(month = lubridate::floor_date(Timestamp, "month")) |>
+  filter_period(.period = "1 month", Timestamp == first(Timestamp)) |>
+  ungroup() |>
+  select(-month)
+n <- nrow(swaption_volatilities_m)
+swaption_volatilities_m_rel <- (swaption_volatilities_m[1:(n - 1), -1] /
+  swaption_volatilities_m[2:n, -1] - 1) |>
+  cbind(Timestamp = swaption_volatilities_m$Timestamp[1:(n - 1)])
+
+swaption_volatilities_by_date_and_interval <- function(impl_vol_daily, start_date, interval) {
+  start_date_year <- year(start_date)
+  start_date_month <- month(start_date)
+  start_date_day <- day(start_date)
+
+  swaption_volatilities_interval <- NULL
+  if (interval == "day") {
+    swaption_volatilities_interval <- impl_vol_daily
+  } else if (interval == "week") {
+    swaption_volatilities_interval <- impl_vol_daily |>
+      mutate(Timestamp_shifted = Timestamp - days(7) + 1) |>
+      group_by(week = lubridate::floor_date(Timestamp_shifted, "week")) |>
+      filter_period(.period = "1 week", .date_var = Timestamp_shifted, Timestamp_shifted == last(Timestamp_shifted)) |>
+      ungroup() |>
+      select(-c(Timestamp_shifted, week))
+  } else if (interval == "month") {
+    swaption_volatilities_interval <- impl_vol_daily |>
+      mutate(Timestamp_shifted = Timestamp - days(start_date_day) + 1) |>
+      group_by(month = lubridate::floor_date(Timestamp_shifted, "month")) |>
+      filter_period(.period = "1 month", .date_var = Timestamp_shifted, Timestamp_shifted == last(Timestamp_shifted)) |>
+      ungroup() |>
+      select(-c(Timestamp_shifted, month))
+  } else if (interval == "year") {
+    swaption_volatilities_interval <- impl_vol_daily |>
+      mutate(Timestamp_shifted = Timestamp - months(start_date_month) - days(start_date_day) + 1) |>
+      group_by(year = lubridate::floor_date(Timestamp_shifted, "year")) |>
+      filter_period(.period = "1 year", .date_var = Timestamp_shifted, Timestamp_shifted == last(Timestamp_shifted)) |>
+      ungroup() |>
+      select(-c(Timestamp_shifted, year))
+  }
+  print(swaption_volatilities_interval)
+  # relative change in swaption implied volatilities
+  n <- nrow(swaption_volatilities_interval)
+  swaption_volatilities_interval_rel <- (swaption_volatilities_interval[1:(n - 1), -1] /
+    swaption_volatilities_interval[2:n, -1] - 1) |>
+    cbind(Timestamp = swaption_volatilities_interval$Timestamp[1:(n - 1)]) |>
+    arrange(Timestamp) |>
+    select(Timestamp, everything()) # move Timestamp column to first position
+
+  return(swaption_volatilities_interval_rel)
+}
+
+# summary table
+swaption_volatilities_d.summary <- swaption_volatilities_d %>%
+  pivot_longer(
+    cols = -Timestamp,
+    names_to = "name",
+    values_to = "value"
+  ) %>%
+  group_by(name) %>%
+  summarize(
+    min = min(value, na.rm = TRUE),
+    quantile1 = quantile(value, 0.01, na.rm = TRUE),
+    quantile25 = quantile(value, 0.25, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    mean = mean(value, na.rm = TRUE),
+    quantile75 = quantile(value, 0.75, na.rm = TRUE),
+    quantile99 = quantile(value, 0.99, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+pander(swaption_volatilities_d.summary)
+
+# replace outlier by mean of adjacent values
+swaption_volatilities_d[swaption_volatilities_d$Timestamp == ymd("2022-11-07"), "25YX5Y"] <-
+  0.5 * (swaption_volatilities_d[swaption_volatilities_d$Timestamp == ymd("2022-11-04"), "25YX5Y"] |> as.numeric() +
+    swaption_volatilities_d[swaption_volatilities_d$Timestamp == ymd("2022-11-08"), "25YX5Y"] |> as.numeric())
+
+plotly_3d(
+  apply(swaption_volatilities_d[, -1], 2, mean),
+  "Average implied volatility surface"
+)
+plotly_3d(
+  apply(swaption_volatilities_d[, -1], 2, var) |> sqrt(),
+  "Daily standard deviation of implied volatilities"
+)
+
+interest_yield <- read_csv("../data_raw/yield_curves_euro_area_aaa.csv")
+interest_yield$Timestamp <- ymd(interest_yield$Timestamp)
+
+filters <- c("^5YX", "^10YX", "^15YX", "^20YX", "^25YX")
+for (filter in filters) {
+  col_filter_indicator <- attr(regexpr(filter, colnames(swaption_volatilities_d)), "match.length") > 0
+  col_filter_indicator[1] <- TRUE
+  data <- swaption_volatilities_d[, col_filter_indicator]
+  additional_time_series <- NULL
+  if (filter == "^5YX") {
+    additional_time_series <- interest_yield[, c("Timestamp", "yield_5y")]
+  } else if (filter == "^10YX") {
+    additional_time_series <- interest_yield[, c("Timestamp", "yield_10y")]
+  } else if (filter == "^20YX") {
+    additional_time_series <- interest_yield[, c("Timestamp", "yield_20y")]
+  }
+  plot <- plot_grouped_implied_volatilities(data, additional_time_series)
+  print(plot)
+}
+
+swaption_volatilities_d_scaled <- scale(swaption_volatilities_d[, -1], center = TRUE, scale = FALSE)
+swaption_volatilities_d_scaled <- tibble(Timestamp = swaption_volatilities_d$Timestamp) |> cbind(swaption_volatilities_d_scaled)
+```
+
+```{r swaptions_implied_volatility_surfaces}
+# plot 5x5 implied volatility surface
+# data: tibble with implied volatility data, timestamp column at position one
+# title: title of plot
+plot_surface <- function(data, title) {
+  points_in_time <- 1:nrow(data)
+
+  aval <- list()
+  for (point_in_time in points_in_time) {
+    aval[[point_in_time]] <- list(
+      visible = FALSE,
+      name = paste0("Date: ", data[point_in_time, 1])
+    )
+  }
+  aval[3][[1]]$visible <- TRUE
+
+  steps <- list()
+  fig <- plot_ly()
+  for (i in points_in_time) {
+    swaption_volatilities_matrix <- impl_vol_row_to_matrix(as.numeric(data[i, -1]))
+    fig <- add_surface(fig,
+      x = seq(5, 25, 5), y = seq(5, 25, 5), z = swaption_volatilities_matrix,
+      name = aval[i][[1]]$name,
+      visible = aval[i][[1]]$visible,
+      showscale = FALSE,
+      contours = list(
+        x = list(show = TRUE),
+        y = list(show = TRUE),
+        z = list(
+          show = TRUE,
+          usecolormap = TRUE
+        )
+      )
+    )
+    step <- list(
+      args = list("visible", rep(FALSE, length(aval))),
+      method = "restyle",
+      label = data[[i, 1]]
+    )
+    step$args[[2]][i] <- TRUE
+    steps[[i]] <- step
+  }
+
+  fig <- fig |>
+    layout(
+      title = title,
+      scene = list(
+        xaxis = list(
+          title = "option period",
+          tickvals = seq(5, 25, 5)
+        ),
+        yaxis = list(
+          title = "swap period",
+          tickvals = seq(5, 25, 5)
+        ),
+        zaxis = list(
+          title = "implied volatility",
+          range = quantile(data[, -1], probs = c(0.01, 0.99), na.rm = TRUE)
+        ),
+        camera = list(
+          eye = list(x = 1.8, y = 1.8, z = -0.5)
+        )
+      ),
+      sliders = list(list(
+        active = 2,
+        currentvalue = list(prefix = "Date: "),
+        steps = steps
+      ))
+    )
+
+  return(fig)
+}
+
+plot_surface(swaption_volatilities_d, "Daily implied normal volatilities")
+```
+The range and shape of implied volatiltity surfaces differ in the course of time. Four exemplary surfaces on four different dates present variations of the volatiltity surfaces over time:
+
+* **2024-07-11**: The implied volatilities range from $48.6$ to $83.9$. The surface is convex. The value is the lowest for a 25YX25 swaption and highest for a 5YX5Y swaption. The shorter the swap or option period, the higher the implied volatility. The magnitude of change in implied volatilities is greater for a change in the option period than for a change in the swap period.
+
+* **2019-12-03**: The implied volatilities range from $43.6$ to $56.1$. The surface is concave. The 25YX25Y swaption has the lowest value whereas the 10YX10Y has the highest value. For option periods greater than five years, the implied volatilities decrease in the swap and option periods. The implied volatilities for swaptions with option period five are smaller compared to swaptions with option period ten and same swap period. In particular, the volatilitiy surface has a remarkable drop in implied volatilities for the 5YX5Y swaption.
+
+* **2019-05-28**: The implied volatilities range from $42.1$ to $53.9$. The surface is concave. The 25YX25Y swaption has the lowest implied volatility. The 10YX5Y swaption exhibits the highest implied volatility. For option periods greater than five years, the implied volatilities decrease in the swap and option periods. The implied volatilities for swaptions with option period five are smaller compared to swaptions with option period ten and same swap period.
+
+* **2015-01-20**: The implied volatilities range from $41.4$ to $72.0$. The values increase for decreasing swap and option periods with variable magnitude. The implied volatility of $64.3$ for 5YX5Y swaptions is clearly smaller than for 5YX10Y, 10YX5Y or 10YX10Y options.
+
+### Observations: Monthly rate of changes
+```{r}
+swaption_volatilities_m_rel <- swaption_volatilities_by_date_and_interval(swaption_volatilities_d, start_date = ymd("2013-02-01"), "month")
+
+plot_surface(swaption_volatilities_m_rel, "Monthly rate of change in implied normal volatilities")
+
+plotly_3d(
+  apply(swaption_volatilities_m_rel[, -1], 2, mean),
+  "Average surface of monthly changes in implied volatility"
+)
+plotly_3d(
+  apply(swaption_volatilities_m_rel[, -1], 2, var) |> sqrt(),
+  "Standard deviation surface of monthly changes in implied volatilities"
+)
+```
+
+### Observations: Weekly rate of changes
+```{r}
+swaption_volatilities_w_rel <- swaption_volatilities_by_date_and_interval(swaption_volatilities_d, start_date = ymd("2013-02-01"), "week")
+
+plotly_3d(
+  apply(swaption_volatilities_w_rel[, -1], 2, mean),
+  "Average surface of weekly changes in implied volatility"
+)
+plotly_3d(
+  apply(swaption_volatilities_w_rel[, -1], 2, var) |> sqrt(),
+  "Standard deviation surface of weekly changes in implied volatilities"
+)
+```
+
+**Observed annual change in implied volatilities**
+```{r, observed_annual_change}
+start_dates <- (swaption_volatilities_d |> arrange(Timestamp))$Timestamp[1:237]
+
+swaption_volatilities_y_rel_stack <- tibble()
+for (i in 1:length(start_dates)) {
+  swaption_volatilities_y_rel_stack <- swaption_volatilities_y_rel_stack |> rbind(swaption_volatilities_by_date_and_interval(swaption_volatilities_d, start_dates[i], "year"))
+}
+tmp <- swaption_volatilities_y_rel_stack |>
+  rowwise() |>
+  mutate(mean = mean(c_across(where(is.numeric)))) |>
+  ungroup() |>
+  arrange(mean) |>
+  select(-mean)
+
+impl_vol_change_untransformed <- tmp[ceiling(0.995 * nrow(tmp)), -1]
+plotly_3d(
+  impl_vol_change_untransformed |> as.numeric(),
+  "99.5% quantile of observed annual change in implied volatilities"
+)
+```
+The plot above shows the empirical 99.5% quantile of the average annual change in implied volatilities among all available reference dates.

@@ -1,0 +1,532 @@
+# Effects of volatility stress on SCR
+
+## Two-factor Hull-White model calibration
+
+```{r nelson_spiegel_svennson_curve}
+# AAA-rated euro bonds 12/29/2023
+beta0 =	0.964141
+beta1 =	3.137166
+beta2 =	-3.946058
+beta3 =	5.088321
+tau1 =	2.251496
+tau2 =	11.815625
+
+# Nelson-Siegel-Svensson curve
+nss <- function(t) { # , beta0 = beta0, beta1 = beta1, beta2 = beta2, beta3 = beta3, tau1 = tau1, tau2 = tau2) {
+  frac1 <- (1 - exp(-t / tau1)) / (t / tau1)
+  frac2 <- (1 - exp(-t / tau2)) / (t / tau2)
+  return((beta0 + beta1 * (frac1) + beta2 * (frac1 - exp(-t / tau1)) + beta3 * (frac2 - exp(-t / tau2))) / 100)
+}
+
+time <- seq(0, 40, length.out = 1000)[-1]
+vizdata <- tibble(
+  time = time,
+  yield = nss(time) * 100
+)
+ggplot(data = vizdata, mapping = aes(time, yield)) +
+  geom_line(color = "blue", linewidth = 0.7) +
+  labs(
+    title = "Yield curve",
+    subtitle = "AAA rated bonds",
+    x = "time",
+    y = "yield (in %)"
+  )
+```
+
+
+```{r hull_white_model_calibration}
+library(nloptr)
+library(pracma)
+library(optimization)
+library(zoomgrid)
+
+N <- 1
+
+# 12/31/2019
+# strikes = matrix(c(0.5398,	0.7731,	0.858,	0.8463,	0.8119,
+# 1.0164,	1.0283,	0.9583,	0.888,	0.8455,
+# 1.0409,	0.927,	0.841,	0.7978,	0.7718,
+# 0.8079,	0.7345,	0.7101,	0.6978, 0.6904,
+# 0.6585,	0.6586,	0.6585,	0.6585,	0.6585)/100, ncol=5)
+
+# 12/29/2023
+strikes <- matrix(c(
+  2.5613, 2.6332, 2.5359, 2.4048, 2.2945,
+  2.7157, 2.5203, 2.3373, 2.2037, 2.1067,
+  2.2971, 2.109, 1.9874, 1.9048, 1.8292,
+  1.8987, 1.8058, 1.7444, 1.6795, 1.6056,
+  1.7034, 1.6554, 1.5917, 1.5139, 1.4486
+) / 100, ncol = 5, byrow = TRUE)
+
+# Hull-White model swaption pricing function (simplified)
+hw_swaption_price <- function(a, b, sigma, eta, rho, option_period, swap_tenor) {
+  # Compute model-implied swaption price based on the Hull-White model
+
+  # strike = swap_rate(option_period, swap_tenor, seq(option_period+0.5, option_period+swap_tenor, by=0.5))
+  strike <- strikes[option_period / 5, swap_tenor / 5]
+  # This is a placeholder function for model swaption pricing
+  model_price <- swaption_price_g2f(
+    nss,
+    a, b, sigma, eta, rho,
+    N, strike, option_period, swap_tenor,
+    tau = 0.5, payer_swaption = FALSE
+  )
+
+  if (is.null(model_price) || !is.finite(model_price)) {
+    return(9)
+  }
+
+  return(model_price) # return model price (for comparison with market data)
+}
+
+# Objective function to minimize (sum of squared errors between market and model volatilities)
+objective_function <- function(params, option_periods, swap_tenors, market_price_surface) {
+  a <- params[1]
+  b <- params[2]
+  sigma <- params[3]
+  eta <- params[4]
+  rho <- params[5]
+
+  # Initialize error sum
+  error_sum <- 0
+
+  # Loop over the market implied volatilities
+  for (i in 1:length(option_periods)) {
+    for (j in 1:length(swap_tenors)) {
+      market_price <- market_price_surface[i, j]
+      model_price <- hw_swaption_price(a, b, sigma, eta, rho, option_periods[i], swap_tenors[j])
+
+      # Add the squared error of relative deviations between market and model prices
+      error_sum <- error_sum + ((model_price - market_price) / market_price)^2
+    }
+  }
+  if (is.null(error_sum) || !is.finite(error_sum)) {
+    return(9)
+  }
+
+  return(error_sum)
+}
+
+# Calibration function for the two-factor Hull-White model
+calibrate_hull_white_2f <- function(option_periods, swap_tenors, market_price_surface) {
+  # Initial guess for the parameters: a, b, sigma, eta, rho
+  initial_params <- c(0.1, 0.1, 0.01, 0.01, 0)
+
+  # Parameter bounds (if needed)
+  lower_bounds <- c(0.01, 0.01, 0, 0, -1) # Ensure positive vols, rho between -1 and 1
+  upper_bounds <- c(1, 1, 0.2, 0.2, 1)
+
+  # Optimize the parameters using the objective function
+  result_sa <- optim_sa(
+    fun = function(params) {
+      objective_function(params, option_periods, swap_tenors, market_price_surface)
+    },
+    start = initial_params,
+    maximization = FALSE,
+    trace = FALSE,
+    lower = lower_bounds,
+    upper = upper_bounds,
+    control = list(
+      dyn_rf = FALSE,
+      rf = 1.6,
+      t0 = 10,
+      nlimit = 200,
+      r = 0.6,
+      t_min = 0.1
+    )
+  )
+  return(result_sa)
+}
+
+calibrate_hull_white_2f_part2 <- function(parameter_guesses) {
+  result <- optim(
+    par = parameter_guesses,
+    fn = function(params) {
+      objective_function(params, option_periods, swap_tenors, market_price_surface)
+    },
+    method = "L-BFGS-B",
+    lower = c(
+      max(parameter_guesses[1] - 0.2, 0.01),
+      max(parameter_guesses[2] - 0.2, 0.01),
+      max(parameter_guesses[3] - 0.1, 0.01),
+      max(parameter_guesses[4] - 0.1, 0.01),
+      -1 # max(parameter_guesses[5]-0.1,-1)
+    ),
+    upper = c(
+      min(parameter_guesses[1] + 0.1, 1),
+      min(parameter_guesses[2] + 0.1, 1),
+      min(parameter_guesses[3] + 0.1, 0.2),
+      min(parameter_guesses[4] + 0.1, 0.2),
+      1 # min(parameter_guesses[5]+0.1,1)
+    )
+  )
+
+  # Return the calibrated parameters
+  return(result)
+}
+
+# option periods and swap tenors (in years)
+option_periods <- seq(5, 25, by = 5)
+swap_tenors <- seq(5, 25, by = 5)
+
+# determine observed swaption prices and volatilities
+joint_quantile <- pca_annualized$joint_quantile_copula
+swaptions_stressed <- compute_stressed_swaptions(ymd("2023-12-29"), swaption_volatilities_d, impl_vol_change_untransformed, NULL, pca, c(0, 0.9848, 0)) # joint_quantile$joint_quantile)
+swaptions_stressed$swaption_surface$impl_vol_stress
+
+swaptions_stressed$swaption_surface$impl_vol_stress_untransformed_abs / swaptions_stressed$swaption_surface$impl_vol_stress_abs
+
+swaptions_stressed$plot_swaption_surface_impl_vol
+
+# market (stressed) price surface
+market_price_surface <- N * matrix(swaptions_stressed$swaption_surface$impl_vol, nrow = length(option_periods), ncol = length(swap_tenors), byrow = TRUE)
+
+# calibrate the Hull-White model
+calibrated_params <- calibrate_hull_white_2f(option_periods, swap_tenors, market_price_surface)
+calibrated_params2 <- calibrate_hull_white_2f_part2(calibrated_params2$par)
+
+a <- calibrated_params2$par[1]
+b <- calibrated_params2$par[2]
+sigma <- calibrated_params2$par[3]
+eta <- calibrated_params2$par[4]
+rho <- calibrated_params2$par[5]
+```
+
+```{r hull_white_model_calibration_evaluation}
+price_model <- matrix(rep(0, 25), ncol = 5)
+error_sum <- 0
+# Loop over the market implied volatilities
+for (i in 1:length(option_periods)) {
+  for (j in 1:length(swap_tenors)) {
+    market_price <- market_price_surface[i, j]
+    # strike = swap_rate(option_periods[i], swap_tenors[j], seq(option_periods[i]+0.5, option_periods[i]+swap_tenors[j], by=0.5))
+    strike <- strikes[i, j]
+    model_price <- hw_swaption_price(
+      a, b, sigma, eta, rho,
+      option_periods[i], swap_tenors[j]
+    )
+
+    price_model[i, j] <- model_price # (model_price - market_price) / market_price - 1
+    print(model_price)
+    error_sum <- error_sum + ((model_price - market_price) / market_price)^2
+  }
+}
+
+objective_function(calibrated_params2$par, option_periods, swap_tenors, market_price_surface)
+
+vizdata <- matrix(c(c(t(market_price_surface)), c(t(price_model))), ncol = 2, byrow = FALSE)
+colnames(vizdata) <- c("market price", "model price")
+plotly_3d(
+  vizdata,
+  "Observed and modeled swaption prices", "Price"
+)
+plotly_3d(
+  matrix(c(c(t(market_price_surface)) - c(price_model)), ncol = 1, byrow = FALSE),
+  "Difference between observed and modeled swaption prices", "Price difference"
+)
+
+sum((price_model - market_price_surface)^2 / market_price_surface^2)
+```
+
+```{r simulate_zero_curves}
+################################################################################
+# G2++ Monte Carlo simulation ##################################################
+################################################################################
+# https://rpubs.com/thierrymoudiki/33287
+# monthly Euler-Maruyama approximation
+# small discretisation bias
+sim_zero_rates <- function(
+    params,
+    drift,
+    n_years,
+    tenor = 0,
+    n_trials = 1,
+    offset = 0 # offset period in years
+    ) {
+  a <- params[1]
+  b <- params[2]
+  sigma <- params[3]
+  eta <- params[4]
+  rho <- params[5]
+
+  n_periods <- (n_years) * 12
+
+  # Pre-allocate space for the factors and forward rate
+  zero_rate <- array(dim = c(n_periods, length(tenor), n_trials))
+  short_rate <- array(dim = c(n_periods, 1, n_trials))
+  x <- matrix(0, nrow = n_trials, ncol = n_periods + 1)
+  y <- matrix(0, nrow = n_trials, ncol = n_periods + 1)
+  dt <- 1 / 12
+
+  # Initial values
+  x[, 1] <- 0
+  y[, 1] <- 0
+
+  simulations <- tibble()
+
+  simulation_sde <- snssde2d(
+    t0 = offset,
+    T = n_years,
+    M = n_trials,
+    Dt = 1 / 12,
+    drift = expression(-a * x, -b * y),
+    diffusion = expression(sigma, eta),
+    corr = matrix(c(1, rho, rho, 1), ncol = 2)
+  )
+  x <- simulation_sde$X
+  y <- simulation_sde$Y
+
+  # Euler-Maruyama simulation loop
+  for (i in 1:n_periods) {
+    W1 <- rnorm(n_trials) # Brownian motion increments for x
+    W2 <- rnorm(n_trials) # Brownian motion increments for y
+
+    # Update x and y using Euler-Maruyama scheme
+    # if (!is.null(drift)) {
+    #   x[,i+1] = a * (drift(TRUE, i/12) - x[,i]) * dt + sigma * sqrt(dt) * W1
+    #   y[,i+1] = b * (drift(FALSE, i/12) - y[,i]) * dt + eta * sqrt(dt) * (rho * W1 + sqrt(1-rho^2) * W2)
+    # } else {
+    #   x[,i+1] = - a * x[,i] * dt + sigma * sqrt(dt) * W1
+    #   y[,i+1] = - b * y[,i] * dt + eta * sqrt(dt) * (rho * W1 + sqrt(1-rho^2) * W2)
+    #   sde.sim(to = 0, T = n_year, X0 = 0, delta = dt, drift = expression(-a*x), sigma=expression(sigma))
+    #
+    # v}
+    # short rate
+    phi <- instantaneous_short_rate(i / 12)
+    short_rate[i, 1, ] <- phi + matrix(x[i + 1, ], nrow = 1) + matrix(y[i + 1, ], nrow = 1)
+    # zero rate
+    # if (tenor > 0) {
+    Bx <- apply(matrix(x[i + 1, ], nrow = 1), 2, function(val) {
+      val * matrix(B(a, i / 12, i / 12 + tenor), ncol = 1)
+    })
+    By <- apply(matrix(y[i + 1, ], nrow = 1), 2, function(val) {
+      val * matrix(B(b, i / 12, i / 12 + tenor), ncol = 1)
+    })
+    log_int <- matrix(rep(log(int_t_T(i / 12, i / 12 + tenor)), times = n_trials), ncol = n_trials, byrow = FALSE)
+    zero_rate[i, , ] <- -(log_int - Bx - By) / matrix(rep(tenor, times = n_trials), ncol = n_trials, byrow = FALSE)
+  }
+
+
+  return(list(
+    short_rate = short_rate,
+    zero_rate = zero_rate
+  ))
+}
+```
+
+
+
+```{r hull_white_model_simulation_risk_neutral}
+surface <- matrix(NA, nrow = 40 * 12 + 1, ncol = 10, byrow = FALSE)
+tenor <- c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+
+simulated_rates <- sim_zero_rates(c(a, b, sigma, eta, rho), NULL, 40, tenor = tenor, n_trials = 2, offset = 0)
+surface <- cbind(simulated_rates$short_rate[, , 1], simulated_rates$zero_rate[, , 1])
+colnames(surface) <- 0:10
+
+# data for wireframes on surface
+df_full <- data.frame(y = seq(1 / 12, 40, by = 1 / 12)) |>
+  cbind(surface) |>
+  pivot_longer(
+    cols = -y,
+    names_to = "x",
+    values_to = "z"
+  ) |>
+  mutate(x = as.numeric(x))
+df1 <- split(df_full, df_full$y)
+df2 <- split(df_full, df_full$x)
+
+surface_plot <- plot_ly() |>
+  add_surface(
+    x = seq(0, 10), y = seq(1 / 12, 40, by = 1 / 12), z = surface,
+    contours = list(
+      z = list(
+        show = TRUE,
+        usecolormap = FALSE,
+        project = list(z = FALSE)
+      )
+    ),
+    opacity = 1
+  )
+
+# iterate over lines and add them to plot:
+for (i in seq_along(df1)) {
+  if (i %% 6 != 0) {
+    next
+  }
+  df_sp <- df1[[i]]
+  surface_plot <- add_trace(surface_plot,
+    line = list(
+      color = "black",
+      width = 2
+    ),
+    mode = "lines",
+    type = "scatter3d",
+    x = df_sp$x,
+    y = df_sp$y,
+    z = df_sp$z,
+    showlegend = FALSE
+  )
+}
+
+for (i in seq_along(df2)) {
+  df_sp <- df2[[i]]
+  surface_plot <- add_trace(surface_plot,
+    line = list(
+      color = "black",
+      width = 2
+    ),
+    mode = "lines",
+    type = "scatter3d",
+    x = df_sp$x,
+    y = df_sp$y,
+    z = df_sp$z,
+    showlegend = FALSE
+  )
+}
+
+surface_plot <- surface_plot |>
+  layout(
+    title = "Evolution of the zero curve for a trial with G2++ model",
+    scene = list(
+      xaxis = list(
+        title = "Tenor",
+        tickvals = seq(0, 10)
+      ),
+      yaxis = list(
+        title = "Time (years)",
+        tickvals = seq(0, 40, by = 5)
+      ),
+      zaxis = list(
+        title = "Spot rate"
+      ),
+      camera = list(
+        eye = list(x = 1.8, y = 1.8, z = -0.5)
+      )
+    )
+  )
+surface_plot
+```
+
+```{r hull_white_real_world_measure}
+tau <- 2 # threshold between short and long term interest rate expectations
+
+# equation for time-dependent drift for real-world calibration of Hull-White model
+rp_eq <- function(dx, dy, lx, ly, t, T_, interest_rate_forecast) {
+  zcb <- PM(T_) / PM(t) * exp(0.5 * (V(t, T_) - V(0, T_) + V(0, t))) * exp(0.5 * V(t, T_))
+
+  expected_rate <- -log(zcb) / (T_ - t) # forward_rate(t, T_)
+
+  factor1 <- B(a, t, T_) / (T_ - t)
+  factor2 <- B(b, t, T_) / (T_ - t)
+  rp_x <- ((exp(-a * (t - min(t, tau))) - exp(-a * t)) * (1 + (dx - lx) / (dx * tau * a)) -
+    exp(-a * (t - min(t, tau))) * (dx - lx) / (dx * tau) * min(t, tau)) * dx +
+    (1 - exp(-a * (t - min(t, tau)))) * lx
+  rp_y <- ((exp(-b * (t - min(t, tau))) - exp(-b * t)) * (1 + (dy - ly) / (dy * tau * b)) -
+    exp(-b * (t - min(t, tau))) * (dy - ly) / (dy * tau) * min(t, tau)) * dy +
+    (1 - exp(-b * (t - min(t, tau)))) * ly
+
+  # rp_x = (exp(-a*(t-min(t,tau)))-exp(-a*t)) * dx + (1-exp(-a*(t-min(t,tau)))) * lx
+  # rp_y = (exp(-b*(t-min(t,tau)))-exp(-b*t)) * dy + (1-exp(-b*(t-min(t,tau)))) * ly
+
+  # rp_x = (1-exp(-a*t))*dx
+  # rp_y = (1-exp(-b*t))*dy
+
+
+  ((expected_rate + factor1 * rp_x + factor2 * rp_y - interest_rate_forecast)^2)
+}
+
+calibrate_risk_premium_drift <- function(t, T_, ir_forecast) {
+  result <- optim(
+    par = c(0.01, 0.01, 0.01, 0.01),
+    fn = function(params) {
+      (rp_eq(params[1], params[2], params[3], params[4], t[1], T_[1], ir_forecast[1]) +
+        rp_eq(params[1], params[2], params[3], params[4], t[2], T_[2], ir_forecast[2]) +
+        rp_eq(params[1], params[2], params[3], params[4], t[3], T_[3], ir_forecast[3]) +
+        rp_eq(params[1], params[2], params[3], params[4], t[4], T_[4], ir_forecast[4])
+      )
+    },
+    method = "Nelder-Mead"
+  )
+  print(result)
+
+
+  return(list(
+    dx = result$par[1],
+    dy = result$par[2],
+    lx = result$par[3],
+    ly = result$par[4]
+  ))
+}
+
+t <- c(2, 2, 40, 40)
+T_ <- c(2.25, 12, 40.25, 50)
+ir_forecast <- c(0.024, 0.027, 0.02, 0.02)
+
+rp <- calibrate_risk_premium_drift(t, T_, ir_forecast)
+
+risk_premium <- function(a, dx, lx, t, tau) {
+  rp_x <- ((exp(-a * (t - min(t, tau))) - exp(-a * t)) * (1 + (dx - lx) / (dx * tau * a)) -
+    exp(-a * (t - min(t, tau))) * (dx - lx) / (dx * tau) * min(t, tau)) * dx +
+    (1 - exp(-a * (t - min(t, tau)))) * lx
+  # rp_x = (exp(-a*(t-min(t,tau)))-exp(-a*t)) * dx + (1-exp(-a*(t-min(t,tau)))) * lx
+  return(rp_x)
+}
+
+d_x <- rp$dx
+d_y <- rp$dy
+l_x <- rp$lx
+l_y <- rp$ly
+
+drift <- function(is_x_drift, t, tau = 2) {
+  drift <- 0
+  if (is_x_drift) {
+    if (t <= tau) {
+      drift <- (1 - (d_x - l_x) / (d_x * tau) * t)
+    }
+    if (t > tau) {
+      drift <- l_x
+    }
+  } else {
+    if (t <= tau) {
+      drift <- (1 - (d_y - l_y) / (d_y * tau) * t)
+    }
+    if (t > tau) {
+      drift <- l_y
+    }
+  }
+
+  return(drift)
+}
+```
+
+```{r hull_white_risk_neutral_real_world_comparison}
+# plot expected risk neutral and real world interest rates
+vizdata <- tibble(
+  time = seq(1, 40, length.out = 500),
+  nss = nss(time),
+  zero_rate_neutral = -log(int_t_T(time, time + 10)) / 10, # instantaneous_short_rate(time),#
+  zero_rate_real = zero_rate_neutral +
+    B(a, time, time + 10) / 10 * risk_premium(a, rp$dx, rp$lx, time, tau) +
+    B(b, time, time + 10) / 10 * risk_premium(b, rp$dy, rp$ly, time, tau)
+)
+
+subtitle <- glue(
+  '<span style="color:{colors["blue"]}">**risk neutral measure**</span> and ',
+  '<span style="color:{colors["orange"]}">**real world measure**</span>'
+)
+
+ggplot(vizdata, aes(x = time)) +
+  geom_line(aes(y = zero_rate_neutral), color = "blue", linewidth = .7) +
+  geom_line(aes(y = zero_rate_real), color = "orange", linewidth = .7) +
+  labs(
+    title = "G2++: Expected 10-year interest rate",
+    subtitle = subtitle,
+    x = "time (years)",
+    y = "10-year interest rate"
+  ) +
+  theme(
+    plot.subtitle = element_markdown(),
+    legend.position = "none"
+  )
+```
