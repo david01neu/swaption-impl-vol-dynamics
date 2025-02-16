@@ -23,3 +23,5 @@ Historic implied swaption volatility data in `swaption_volatilities.csv` is obta
 | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------|
 | g2pp_calibration_simulation_sensitvity_analysis.m | Market-consistent calibration of HW2/G2++ model, simulations of stylistic insurance liability and sensitivity analysis of G2++ parameters |
 | LinearGaussian2Fcustom.m                          | Helper functions for G2++ model analytic formulas                                                                                         |
+
+The numerical optimization algorithm employed in the MATLAB scripts is Controlled Random Search (CRS) with local mutation from the free/open-source library [NLopt](https://nlopt.readthedocs.io/en/latest/NLopt_Algorithms/#controlled-random-search-crs-with-local-mutation) for nonlinear optimization.
