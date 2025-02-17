@@ -275,7 +275,7 @@ principal_component_viz <- function(pca, # prcomp class
       plot <- ggplot(data = df_pc_projection, aes(x = projection)) +
         geom_histogram(aes(y = ..density..)) +
         geom_density(colour = "blue", linewidth = 0.8) +
-        geom_vline(aes(xintercept = upper_quantile), linewidth = 0.8, linetype = "dashed", colour = "darkgreen") +
+        geom_vline(xintercept = upper_quantile, linewidth = 0.8, linetype = "dashed", colour = "darkgreen") +
         annotate(geom = "text", x = upper_quantile, y = 0.3, hjust = -0.1, label = formatC(upper_quantile, 4), color = "darkgreen") +
         annotate(
           geom = "text", x = -Inf, y = Inf, hjust = 1, vjust = 1,
@@ -436,7 +436,7 @@ principal_component_viz <- function(pca, # prcomp class
         geom_histogram(aes(y = ..density..)) +
         # geom_line(aes(y = dnorm(value, mean = mean(annualized_simulations_copula), sd = sqrt(var(annualized_simulations_copula))))) +
         geom_density(colour = "blue", linewidth = 0.8) +
-        geom_vline(aes(xintercept = upper_quantile_copula), linewidth = 0.8, linetype = "dashed", colour = "darkgreen") +
+        geom_vline(xintercept = upper_quantile_copula, linewidth = 0.8, linetype = "dashed", colour = "darkgreen") +
         annotate(geom = "text", x = upper_quantile_copula, y = 0.3, hjust = -0.1, label = formatC(upper_quantile_copula, 4), color = "darkgreen") +
         # annotate(geom = "text", x = -Inf, y = Inf, hjust=0, vjust=1,
         #          label = TeX(paste0("$\\hat{\\mu}$ = ", formatC(mean(annualized_simulations_copula), digits=4),
@@ -554,7 +554,7 @@ principal_component_viz <- function(pca, # prcomp class
         geom_histogram(aes(y = ..density..)) +
         # geom_line(aes(y = dnorm(value, mean = mean(annualized_simulations_ar), sd = sqrt(var(annualized_simulations_ar))))) +
         geom_density(colour = "blue", linewidth = 0.8) +
-        geom_vline(aes(xintercept = as.numeric(upper_quantile_ar)), linewidth = 0.8, linetype = "dashed", colour = "darkgreen") +
+        geom_vline(xintercept = as.numeric(upper_quantile_ar), linewidth = 0.8, linetype = "dashed", colour = "darkgreen") +
         annotate(geom = "text", x = upper_quantile_ar, y = 0.2, hjust = 0, label = formatC(upper_quantile_ar, 4), color = "darkgreen") +
         # annotate(geom = "text", x = -Inf, y = Inf, hjust=0, vjust=1,
         #          label = TeX(paste0("$\\hat{\\mu}$ = ", formatC(mean(annualized_simulations_ar), digits=4),
